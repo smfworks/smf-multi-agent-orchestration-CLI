@@ -1,0 +1,30 @@
+# Default forge.yaml template — smf-forge init
+project: ${FORGE_PROJECT:my-project}
+version: "0.1.0"
+
+agents:
+  echo:
+    type: echo
+    system_prompt: "You are a helpful echo agent."
+
+  reviewer:
+    type: http
+    model: gpt-4
+    system_prompt: "You are a code reviewer. Analyze the input and provide feedback."
+    base_url: ${OPENAI_BASE_URL:https://api.openai.com/v1}
+    api_key: ${OPENAI_API_KEY}
+    temperature: 0.3
+
+pipelines:
+  review:
+    name: review
+    steps:
+      - name: echo_input
+        agent: echo
+        prompt: "{{ prompt }}"
+
+      - name: review_output
+        agent: reviewer
+        prompt: "Review this output:\n{{ echo_input.response }}"
+        depends_on:
+          - echo_input
