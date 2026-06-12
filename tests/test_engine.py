@@ -3,7 +3,7 @@
 import asyncio
 import pytest
 
-from smf_forge.agents import AgentConfig, EchoAgent, BaseAgent, build_agent, build_registry
+from smf_forge.agents import AgentConfig, BaseAgent, EchoAgent, build_agent, build_registry
 from smf_forge.engine import PipelineEngine, PipelineResult, StepStatus
 
 
@@ -44,6 +44,16 @@ class TestPipelineOrdering:
         ]
         with pytest.raises(ValueError, match="circular"):
             engine._resolve_order(steps)
+
+
+class FailingAgent(BaseAgent):
+    """Agent that returns an error dict (like HttpAgent with no API key)."""
+
+    def __init__(self, config):
+        super().__init__(config)
+
+    async def run(self, prompt: str, context: dict | None = None) -> dict:
+        return {"error": "No API key configured", "agent": self.config.name}
 
 
 class TestPipelineExecution:
@@ -117,6 +127,39 @@ class TestPipelineExecution:
         assert not result.success
         # Both should attempt to run (not skipped)
         assert all(s.status == StepStatus.FAILED for s in result.steps)
+
+    def test_initial_context(self):
+        """Bug fix: initial_context should be available to step templates."""
+        registry = build_registry({"echo1": {"type": "echo"}})
+        pipeline = {
+            "name": "ctx-test",
+            "steps": [{"name": "greet", "agent": "echo1", "prompt": "{{ prompt }}"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry, initial_context={"prompt": "from CLI"}))
+        assert result.success
+        assert result.steps[0].output["echo"] == "from CLI"
+
+    def test_error_dict_treated_as_failure(self):
+        """Bug fix: agents returning {error: ...} should be FAILED, not SUCCESS."""
+        config = AgentConfig(name="failing", type="echo")
+        registry = {"failing": FailingAgent(config)}
+        pipeline = {
+            "name": "error-dict-test",
+            "steps": [{"name": "step1", "agent": "failing", "prompt": "try me"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry))
+        assert not result.success
+        assert result.steps[0].status == StepStatus.FAILED
+        assert "No API key" in result.steps[0].error
+
+    def test_empty_pipeline(self):
+        engine = PipelineEngine()
+        pipeline = {"name": "empty", "steps": []}
+        result = asyncio.run(engine.run(pipeline, {}))
+        assert result.success
+        assert len(result.steps) == 0
 
 
 class TestAgentBuilder:

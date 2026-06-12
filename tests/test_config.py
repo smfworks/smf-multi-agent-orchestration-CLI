@@ -142,3 +142,22 @@ class TestResolveEnvVars:
         data = {"agents": {"a": {"base_url": "${MY_URL}"}}}
         result = resolve_env_vars(data)
         assert result["agents"]["a"]["base_url"] == "http://localhost:8080"
+
+    def test_default_value_when_env_not_set(self):
+        """Bug fix: ${VAR:default} syntax should use default when env var not set."""
+        data = {"project": "${NONEXISTENT_PROJECT:my-default}"}
+        result = resolve_env_vars(data)
+        assert result["project"] == "my-default"
+
+    def test_default_value_overridden_by_env(self, monkeypatch):
+        """When env var IS set, default should be ignored."""
+        monkeypatch.setenv("MY_PROJECT", "from-env")
+        data = {"project": "${MY_PROJECT:fallback}"}
+        result = resolve_env_vars(data)
+        assert result["project"] == "from-env"
+
+    def test_default_value_with_url(self):
+        """Bug fix: ${VAR:https://...} should work with colons in defaults."""
+        data = {"agents": {"a": {"base_url": "${MISSING_URL:https://api.openai.com/v1}"}}}
+        result = resolve_env_vars(data)
+        assert result["agents"]["a"]["base_url"] == "https://api.openai.com/v1"

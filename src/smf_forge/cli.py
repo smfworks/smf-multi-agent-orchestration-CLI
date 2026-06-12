@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import shutil
 import sys
 from pathlib import Path
 
@@ -110,22 +109,17 @@ def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bo
         err_console.print(f"[red]Agent error:[/red] {exc}")
         sys.exit(1)
 
-    # Inject prompt into context if provided
-    context = {}
+    # Build initial context — include prompt if provided so steps can template it
+    initial_context: dict = {}
     if prompt:
-        context["prompt"] = prompt
+        initial_context["prompt"] = prompt
 
     engine = PipelineEngine(fail_fast=fail_fast, verbose=verbose)
 
     console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
 
-    result = asyncio.run(engine.run(pipeline, registry))
-
-    # If prompt was given, inject it into step context
-    if prompt:
-        for step in result.steps:
-            if step.status == StepStatus.SUCCESS and step.output is None:
-                step.output = {"prompt": prompt}
+    # Pass initial context to engine so steps can reference {{ prompt }}
+    result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
 
     engine.print_result(result)
 

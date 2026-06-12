@@ -100,16 +100,27 @@ def validate_config(data: dict[str, Any]) -> list[str]:
 
 
 def resolve_env_vars(data: dict[str, Any]) -> dict[str, Any]:
-    """Resolve ${ENV_VAR} references in string values throughout the config."""
+    """Resolve ${ENV_VAR} and ${ENV_VAR:default} references in string values throughout the config.
+
+    Supports two syntaxes:
+    - ${VAR} — resolves from environment, raises if not set
+    - ${VAR:default_value} — resolves from environment, uses default if not set
+    """
 
     def _resolve(value: Any) -> Any:
         if isinstance(value, str):
             if value.startswith("${") and value.endswith("}"):
-                env_name = value[2:-1]
-                env_val = os.environ.get(env_name)
-                if env_val is None:
-                    raise ConfigError(f"Environment variable '{env_name}' not set")
-                return env_val
+                inner = value[2:-1]
+                # Check for default value syntax: ${VAR:default}
+                if ":" in inner:
+                    env_name, default = inner.split(":", 1)
+                    return os.environ.get(env_name, default)
+                else:
+                    env_name = inner
+                    env_val = os.environ.get(env_name)
+                    if env_val is None:
+                        raise ConfigError(f"Environment variable '{env_name}' not set")
+                    return env_val
             return value
         if isinstance(value, dict):
             return {k: _resolve(v) for k, v in value.items()}

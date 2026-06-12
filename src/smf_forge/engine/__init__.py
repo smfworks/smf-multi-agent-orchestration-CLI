@@ -148,6 +148,18 @@ class PipelineEngine:
         try:
             output = await agent.run(prompt, context)
             duration = (time.monotonic() - start) * 1000
+
+            # Check if agent returned an error dict — treat as failure
+            if isinstance(output, dict) and "error" in output and "response" not in output:
+                return StepResult(
+                    step_name=step["name"],
+                    agent_name=agent_name,
+                    status=StepStatus.FAILED,
+                    error=output["error"],
+                    output=output,
+                    duration_ms=duration,
+                )
+
             return StepResult(
                 step_name=step["name"],
                 agent_name=agent_name,
@@ -169,12 +181,15 @@ class PipelineEngine:
         self,
         pipeline: dict,
         agent_registry: dict,
+        initial_context: dict | None = None,
     ) -> PipelineResult:
         """Execute a full pipeline.
 
         Args:
             pipeline: Pipeline config dict with 'name' and 'steps'.
             agent_registry: Map of agent_name → Agent instance.
+            initial_context: Optional initial context (e.g. {"prompt": "..."}) available
+                to all steps via Jinja2 templating.
 
         Returns:
             PipelineResult with per-step outcomes.
@@ -187,7 +202,7 @@ class PipelineEngine:
 
         layers = self._resolve_order(steps)
         start = time.monotonic()
-        context: dict[str, Any] = {}
+        context: dict[str, Any] = dict(initial_context or {})
         results: list[StepResult] = []
         has_failure = False
 
@@ -239,7 +254,7 @@ class PipelineEngine:
         for step in result.steps:
             icon = status_emoji.get(step.status, "?")
             dur = f"({step.duration_ms:.0f}ms)" if step.duration_ms else ""
-            label = f"{icon} {step.step_name} [{dim}]{step.agent_name}[/] {dur}"
+            label = f"{icon} {step.step_name} [dim]{step.agent_name}[/dim] {dur}"
             branch = tree.add(label)
             if step.error:
                 branch.add(f"[red]{step.error}[/red]")
