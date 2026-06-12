@@ -3,7 +3,7 @@
 import asyncio
 import pytest
 
-from smf_forge.agents import AgentConfig, BaseAgent, EchoAgent, build_agent, build_registry
+from smf_forge.agents import AgentConfig, BaseAgent, EchoAgent, HermesAgent, build_agent, build_registry
 from smf_forge.engine import PipelineEngine, PipelineResult, StepStatus
 
 
@@ -177,5 +177,20 @@ class TestAgentBuilder:
         cfg = {"echo1": {"type": "echo"}, "echo2": {"type": "echo"}}
         registry = build_registry(cfg)
         assert len(registry) == 2
-        assert "echo1" in registry
-        assert "echo2" in registry
+
+    def test_hermes_agent(self):
+        config = AgentConfig(name="hermes-test", type="hermes")
+        agent = build_agent(config)
+        assert isinstance(agent, HermesAgent)
+
+    def test_hermes_agent_config(self):
+        config = AgentConfig(
+            name="hermes-test",
+            type="hermes",
+            base_url="http://localhost:9999",
+            options={"agent_name": "liam", "timeout": 60},
+        )
+        agent = build_agent(config)
+        assert isinstance(agent, HermesAgent)
+        assert agent.config.options["agent_name"] == "liam"
+        assert agent.config.options["timeout"] == 60

@@ -125,12 +125,72 @@ class TransformAgent(BaseAgent):
             return {"error": str(exc), "agent": self.config.name}
 
 
+class HermesAgent(BaseAgent):
+    """Calls a Hermes/OpenClaw-compatible agent endpoint.
+
+    Sends the prompt as a task to a running Hermes agent and returns the
+    response. This is dogfooding — smf-forge agents talking to Hermes agents.
+
+    Config options:
+      endpoint: Hermes API base URL (default: http://localhost:8642)
+      agent_name: Name of the Hermes agent to invoke (default: "default")
+      timeout: Request timeout in seconds (default: 120)
+    """
+
+    async def run(self, prompt: str, context: dict | None = None) -> dict:
+        endpoint = self.config.options.get(
+            "endpoint", self.config.base_url or "http://localhost:8642"
+        )
+        agent_name = self.config.options.get("agent_name", "default")
+        timeout = int(self.config.options.get("timeout", 120))
+        api_key = self.config.api_key
+
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload = {
+            "agent": agent_name,
+            "prompt": prompt,
+            "context": context or {},
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{endpoint}/api/agent/run",
+                    headers=headers,
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return {
+                    "response": data.get("response", data.get("output", str(data))),
+                    "agent": self.config.name,
+                    "hermes_agent": agent_name,
+                    "raw": data,
+                }
+        except httpx.HTTPStatusError as exc:
+            return {
+                "error": f"Hermes API HTTP {exc.response.status_code}: {exc.response.text[:500]}",
+                "agent": self.config.name,
+            }
+        except httpx.ConnectError:
+            return {
+                "error": f"Cannot connect to Hermes at {endpoint}. Is Hermes running?",
+                "agent": self.config.name,
+            }
+        except Exception as exc:
+            return {"error": str(exc), "agent": self.config.name}
+
+
 # Registry of built-in agent types
 AGENT_TYPES: dict[str, type[BaseAgent]] = {
     "echo": EchoAgent,
     "http": HttpAgent,
     "shell": ShellAgent,
     "transform": TransformAgent,
+    "hermes": HermesAgent,
 }
 
 
