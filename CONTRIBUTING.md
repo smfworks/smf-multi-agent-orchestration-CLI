@@ -125,7 +125,16 @@ chore: bump version to 1.1.0
 
 ## CI/CD
 
-GitHub Actions runs linting and tests on every push and pull request (see `.github/workflows/ci.yml`). All checks must pass before merging.
+`.github/workflows/ci.yml` runs linting and tests on every push and pull request (Python 3.10–3.13). All checks must pass before merging.
+
+Some org PATs lack the `workflow` scope, so `git push` of `.github/workflows/*` is rejected. When that happens, do **not** force-push the workflow with the limited PAT. Publish or update CI via:
+
+1. The GitHub web editor on the target branch (or Actions → New workflow), or
+2. A PAT / GitHub App token that includes the `workflow` scope.
+
+The workflow file in this repo is the source of truth even when it is not yet on `main`.
+
+Do not weaken shell-agent isolation to make a test pass. The step prompt is never a command.
 
 ## License
 

@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from jinja2 import Template
+from jinja2.exceptions import TemplateError
 from rich.console import Console
 from rich.tree import Tree
 
@@ -207,12 +209,15 @@ class PipelineEngine:
         # Render prompt template with context
         prompt_template = step.get("prompt", "")
         try:
-            from jinja2 import Template
-
             prompt = Template(prompt_template).render(**context)
-        except Exception as exc:
-            logger.warning("Template render failed for step '%s': %s", step_name, exc)
-            prompt = prompt_template
+        except TemplateError as exc:
+            return StepResult(
+                step_name=step_name,
+                agent_name=agent_name,
+                status=StepStatus.FAILED,
+                error=f"Prompt template error: {exc}",
+                duration_ms=(time.monotonic() - start) * 1000,
+            )
 
         try:
             output = await agent.run(prompt, context)

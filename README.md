@@ -44,29 +44,31 @@ SMF Forge lets you declare agents and pipelines in a simple `forge.yaml` file, t
 
 ## Install
 
-```bash
-pip install smf-forge
-```
-
-Or from source:
+This package is **not published to PyPI yet**. Install from source.
 
 ```bash
 git clone https://github.com/smfworks/smf-multi-agent-orchestration-CLI.git
 cd smf-multi-agent-orchestration-CLI
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
+smf-forge --version
 ```
 
 Requires Python 3.10+.
 
 ## Quick Start
 
-### 1. Initialize a project
+No API keys required.
 
 ```bash
 smf-forge init --name my-project
+smf-forge validate
+smf-forge agents
+smf-forge run demo --prompt "Explain quantum computing"
 ```
 
-This creates a `forge.yaml` template in the current directory.
+`init` writes an echo-only `demo` pipeline so the first run works offline.
 
 ### 2. Define agents and pipelines
 
@@ -115,7 +117,7 @@ smf-forge run research-summarize --prompt "Explain quantum computing"
 |------|-------------|------------|
 | `echo` | Returns the input — useful for testing pipelines | — |
 | `http` | Calls an OpenAI-compatible chat completions endpoint | `model`, `base_url`, `api_key` |
-| `shell` | Runs a shell command and returns stdout/stderr/exit code | `options.command` |
+| `shell` | Runs a **configured** command (never the prompt). Argv by default | `options.command`, optional `shell: true` |
 | `transform` | Applies a Jinja2 template to context data | `options.template` |
 | `hermes` | Calls a Hermes/OpenClaw-compatible agent endpoint | `options.endpoint`, `options.agent_name` |
 

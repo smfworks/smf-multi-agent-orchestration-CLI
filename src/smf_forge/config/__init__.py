@@ -273,7 +273,7 @@ def _detect_cycles(pipeline_name: str, steps: list[dict], errors: list[str]) -> 
 # Environment variable resolution
 # --------------------------------------------------------------------------- #
 
-def resolve_env_vars(data: dict[str, Any]) -> dict[str, Any]:
+def resolve_env_vars(data: dict[str, Any], *, strict: bool = True) -> dict[str, Any]:
     """Resolve ``${ENV_VAR}`` and ``${ENV_VAR:default}`` references in string values.
 
     Supports two syntaxes:
@@ -306,7 +306,9 @@ def resolve_env_vars(data: dict[str, Any]) -> dict[str, Any]:
                     env_name = inner
                     env_val = os.environ.get(env_name)
                     if env_val is None:
-                        raise ConfigError(f"Environment variable '{env_name}' not set")
+                        if strict:
+                            raise ConfigError(f"Environment variable '{env_name}' not set")
+                        return ""
                     return env_val
             return value
         if isinstance(value, dict):

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "smf-forge"
-version = "1.0.0"
+version = "1.0.1"
 description = "Lightweight multi-agent orchestration CLI — define, compose, and run AI agent pipelines from the terminal"
 readme = "README.md"
 license = "MIT"

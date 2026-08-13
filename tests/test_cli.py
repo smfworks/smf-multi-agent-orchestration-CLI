@@ -55,7 +55,7 @@ class TestVersion:
     def test_version_flag(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "1.0.0" in result.output
+        assert "1.0.1" in result.output
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +84,22 @@ class TestInit:
         # Should not have overwritten
         content = (tmp_path / CONFIG_FILENAME).read_text()
         assert "old" in content
+
+
+    def test_init_run_demo_without_secrets(self, runner: CliRunner, tmp_path: Path) -> None:
+        init = runner.invoke(main, ["init", "--name", "smoke", "-d", str(tmp_path)])
+        assert init.exit_code == 0
+        validate = runner.invoke(main, ["validate", "--config", str(tmp_path / CONFIG_FILENAME)])
+        assert validate.exit_code == 0
+        assert "Config is valid" in " ".join(validate.output.split())
+        agents = runner.invoke(main, ["agents", "--config", str(tmp_path / CONFIG_FILENAME)])
+        assert agents.exit_code == 0
+        run = runner.invoke(
+            main,
+            ["run", "demo", "--config", str(tmp_path / CONFIG_FILENAME), "--prompt", "hello"],
+        )
+        assert run.exit_code == 0, run.output
+        assert "hello" in run.output or "succeeded" in run.output.lower() or "✓" in run.output
 
 
 # --------------------------------------------------------------------------- #

@@ -60,12 +60,13 @@ class TestShellAgent:
         assert result["exit_code"] == 0
         assert "hello123" in result["stdout"]
 
-    def test_uses_prompt_as_command(self) -> None:
+    def test_does_not_use_prompt_as_command(self) -> None:
         config = AgentConfig(name="sh1", type="shell")
         agent = ShellAgent(config)
         result = asyncio.run(agent.run("echo from-prompt"))
-        assert result["exit_code"] == 0
-        assert "from-prompt" in result["stdout"]
+        assert "error" in result
+        assert "options.command" in result["error"]
+        assert "from-prompt" not in result.get("stdout", "")
 
     def test_command_failure(self) -> None:
         config = AgentConfig(
@@ -74,6 +75,7 @@ class TestShellAgent:
         agent = ShellAgent(config)
         result = asyncio.run(agent.run("x"))
         assert result["exit_code"] != 0
+        assert "error" in result
 
     def test_command_timeout(self) -> None:
         config = AgentConfig(
