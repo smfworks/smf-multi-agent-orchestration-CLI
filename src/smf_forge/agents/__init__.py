@@ -124,9 +124,14 @@ class HttpAgent(BaseAgent):
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        base_url = self.config.base_url or "https://api.openai.com/v1"
+        from smf_forge.endpoints import UnsafeEndpoint, validate_http_endpoint
+
+        try:
+            base_url = validate_http_endpoint(self.config.base_url or "https://api.openai.com/v1")
+        except UnsafeEndpoint as exc:
+            return {"error": str(exc), "agent": self.config.name}
         api_key = self.config.api_key
-        model = self.config.model or "gpt-4"
+        model = self.config.model or "gpt-4o-mini"
 
         if not api_key:
             return {"error": "No API key configured for HTTP agent", "agent": self.config.name}
@@ -261,14 +266,17 @@ class TransformAgent(BaseAgent):
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        from jinja2 import Template
+        from jinja2.exceptions import SecurityError, TemplateError
+        from jinja2.sandbox import SandboxedEnvironment
 
         template_str = self.config.options.get("template", "{{ prompt }}")
         try:
-            rendered = Template(template_str).render(prompt=prompt, **(context or {}))
+            rendered = SandboxedEnvironment().from_string(template_str).render(
+                prompt=prompt, **(context or {})
+            )
             return {"result": rendered, "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except (TemplateError, SecurityError) as exc:
+            return {"error": f"Template error: {exc}", "agent": self.config.name}
 
 
 class HermesAgent(BaseAgent):
@@ -284,9 +292,15 @@ class HermesAgent(BaseAgent):
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        endpoint = self.config.options.get(
+        from smf_forge.endpoints import UnsafeEndpoint, validate_http_endpoint
+
+        raw_endpoint = self.config.options.get(
             "endpoint", self.config.base_url or "http://localhost:8642"
         )
+        try:
+            endpoint = validate_http_endpoint(str(raw_endpoint))
+        except UnsafeEndpoint as exc:
+            return {"error": str(exc), "agent": self.config.name}
         agent_name = self.config.options.get("agent_name", "default")
         timeout = int(self.config.options.get("timeout", 120))
         api_key = self.config.api_key

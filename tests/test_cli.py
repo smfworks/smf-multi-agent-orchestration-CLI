@@ -55,7 +55,9 @@ class TestVersion:
     def test_version_flag(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "1.0.1" in result.output
+        from smf_forge import __version__
+
+        assert __version__ in result.output
 
 
 # --------------------------------------------------------------------------- #

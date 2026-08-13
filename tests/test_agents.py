@@ -125,6 +125,17 @@ class TestTransformAgent:
         result = asyncio.run(agent.run("x"))
         assert "error" in result
 
+    def test_sandbox_blocks_attr_escape(self) -> None:
+        config = AgentConfig(
+            name="t1",
+            type="transform",
+            options={"template": "{{ ''.__class__.__mro__ }}"},
+        )
+        agent = TransformAgent(config)
+        result = asyncio.run(agent.run("x"))
+        assert "error" in result
+        assert "result" not in result or "__class__" not in str(result.get("result"))
+
 
 # --------------------------------------------------------------------------- #
 # HttpAgent (error paths only — no real API calls)
@@ -137,6 +148,15 @@ class TestHttpAgent:
         result = asyncio.run(agent.run("hello"))
         assert "error" in result
         assert "No API key" in result["error"]
+
+    def test_rejects_non_http_endpoint(self) -> None:
+        config = AgentConfig(
+            name="h1", type="http", api_key="x", base_url="file:///etc/passwd"
+        )
+        agent = HttpAgent(config)
+        result = asyncio.run(agent.run("hello"))
+        assert "error" in result
+        assert "http" in result["error"]
 
     def test_connection_error(self) -> None:
         config = AgentConfig(

@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from jinja2 import Template
-from jinja2.exceptions import TemplateError
+from jinja2.exceptions import SecurityError, TemplateError
+from jinja2.sandbox import SandboxedEnvironment
 from rich.console import Console
 from rich.tree import Tree
 
@@ -209,8 +209,8 @@ class PipelineEngine:
         # Render prompt template with context
         prompt_template = step.get("prompt", "")
         try:
-            prompt = Template(prompt_template).render(**context)
-        except TemplateError as exc:
+            prompt = SandboxedEnvironment().from_string(prompt_template).render(**context)
+        except (TemplateError, SecurityError) as exc:
             return StepResult(
                 step_name=step_name,
                 agent_name=agent_name,
