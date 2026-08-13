@@ -239,3 +239,13 @@ class TestRunCommand:
             ["run", "any", "--config", str(tmp_path / CONFIG_FILENAME)],
         )
         assert result.exit_code == 1
+
+    def test_run_with_timeout_option(self, runner: CliRunner, valid_project: Path) -> None:
+        """CLI --timeout option should be accepted and passed to engine."""
+        cfg = str(valid_project / CONFIG_FILENAME)
+        result = runner.invoke(
+            main,
+            ["run", "test-pipe", "--config", cfg, "--prompt", "hello", "--timeout", "30"],
+        )
+        assert result.exit_code == 0
+        assert "succeeded" in result.output

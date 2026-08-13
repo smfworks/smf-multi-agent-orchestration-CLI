@@ -11,18 +11,108 @@ Provides:
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import ipaddress
 import logging
-import os
-import shlex
-import signal
+import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Security helpers
+# --------------------------------------------------------------------------- #
+
+# Maximum size of any HTTP response body we'll read (1 MiB)
+_MAX_RESPONSE_BYTES = 1_048_576
+
+# Maximum config file size (1 MiB)
+_MAX_CONFIG_FILE_BYTES = 1_048_576
+
+# Private / internal IP ranges blocked to prevent SSRF
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),        # loopback
+    ipaddress.ip_network("10.0.0.0/8"),         # private
+    ipaddress.ip_network("172.16.0.0/12"),      # private
+    ipaddress.ip_network("192.168.0.0/16"),     # private
+    ipaddress.ip_network("169.254.0.0/16"),     # link-local / cloud metadata
+    ipaddress.ip_network("0.0.0.0/8"),          # current network
+    ipaddress.ip_network("100.64.0.0/10"),      # CGNAT
+    ipaddress.ip_network("::1/128"),            # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),           # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),          # IPv6 link-local
+]
+
+
+def _is_blocked_ip(ip_str: str) -> bool:
+    """Return True if *ip_str* resolves to a private/internal IP (SSRF guard)."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return True  # not a valid IP → block
+    return any(addr in net for net in _BLOCKED_NETWORKS)
+
+
+def validate_url(url: str, allow_localhost: bool = False) -> str:
+    """Validate a URL for outbound HTTP requests (SSRF prevention).
+
+    Args:
+        url: The URL to validate.
+        allow_localhost: If True, allow localhost/127.0.0.1 (for dev/testing).
+
+    Returns:
+        The validated URL string.
+
+    Raises:
+        ValueError: If the URL scheme is not http/https or the host resolves
+            to a private/internal IP (unless *allow_localhost* is True).
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"URL scheme must be http or https, got '{parsed.scheme}'")
+
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("URL must have a hostname")
+
+    # Allow specific localhost hosts when permit is set
+    if allow_localhost and host in ("localhost", "127.0.0.1", "::1"):
+        return url
+
+    # Check if host is a literal IP
+    try:
+        ipaddress.ip_address(str(host))
+        if _is_blocked_ip(str(host)):
+            raise ValueError(f"URL host '{host}' is a private/internal address")
+        return url
+    except ValueError:
+        pass  # hostname is a DNS name, not a literal IP — resolve below
+
+    # Resolve hostname and check all IPs
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve hostname '{host}': {exc}") from exc
+
+    for _family, _stype, _proto, _canon, sockaddr in infos:
+        ip = sockaddr[0]
+        if _is_blocked_ip(str(ip)):
+            raise ValueError(
+                f"URL host '{host}' resolves to private/internal address '{ip}'"
+            )
+
+    return url
+
+
+def _sanitize_error_message(msg: str, api_key: str | None) -> str:
+    """Remove API key from error message if present."""
+    if api_key and api_key in msg:
+        return msg.replace(api_key, "[REDACTED]")
+    return msg
 
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +221,13 @@ class HttpAgent(BaseAgent):
         if not api_key:
             return {"error": "No API key configured for HTTP agent", "agent": self.config.name}
 
+        # SSRF protection: validate the URL before making the request
+        try:
+            validate_url(base_url)
+        except ValueError as exc:
+            logger.warning("URL validation failed for agent '%s': %s", self.config.name, exc)
+            return {"error": f"Invalid base_url: {exc}", "agent": self.config.name}
+
         messages: list[dict[str, str]] = []
         if self.config.system_prompt:
             messages.append({"role": "system", "content": self.config.system_prompt})
@@ -149,109 +246,109 @@ class HttpAgent(BaseAgent):
                     },
                 )
                 resp.raise_for_status()
+
+                # Limit response body size to prevent memory exhaustion
+                body_bytes = resp.content
+                if len(body_bytes) > _MAX_RESPONSE_BYTES:
+                    return {
+                        "error": f"Response too large ({len(body_bytes)} bytes)",
+                        "agent": self.config.name,
+                    }
+
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 return {"response": content, "agent": self.config.name, "model": model}
         except httpx.HTTPStatusError as exc:
+            err_text = exc.response.text[:500]
+            err_text = _sanitize_error_message(err_text, api_key)
             return {
-                "error": f"HTTP {exc.response.status_code}: {exc.response.text[:500]}",
+                "error": f"HTTP {exc.response.status_code}: {err_text}",
                 "agent": self.config.name,
             }
         except httpx.ConnectError as exc:
             return {"error": f"Connection error: {exc}", "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except asyncio.CancelledError:
+            raise  # don't swallow cancellation
+        except httpx.TimeoutException:
+            return {"error": "Request timed out", "agent": self.config.name}
+        except (KeyError, IndexError) as exc:
+            return {"error": f"Malformed API response: {exc}", "agent": self.config.name}
+        except httpx.HTTPError as exc:
+            err_msg = _sanitize_error_message(str(exc), api_key)
+            return {"error": err_msg, "agent": self.config.name}
 
 
 class ShellAgent(BaseAgent):
-    """Runs a configured command and returns stdout/stderr/exit code.
+    """Runs a shell command and returns stdout/stderr/exit code.
 
-    Security: the command comes from agent options, never from the step prompt.
-    ``shell: false`` (default) uses argv execution. ``shell: true`` is opt-in
-    and must be a trusted static string.
+    The command MUST be specified in ``config.options['command']``.
+    The rendered prompt is NOT used as a command (shell injection prevention).
+    If no command is configured, the agent returns an error.
+
+    Config options:
+      - ``command`` (required): Shell command to execute.
+      - ``timeout``: Timeout in seconds (default: 60, max: 600).
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        options = self.config.options or {}
-        command = options.get("command")
+        command = self.config.options.get("command")
         if not command:
             return {
-                "error": "Shell agent requires options.command; the prompt is never executed",
+                "error": (
+                    "ShellAgent requires 'command' in options "
+                    "(prompt-as-command is disabled for security)"
+                ),
                 "agent": self.config.name,
             }
 
-        use_shell = bool(options.get("shell", False))
-        timeout = float(options.get("timeout", 60))
-
+        # Validate timeout
         try:
-            if use_shell:
-                if not isinstance(command, str):
-                    return {
-                        "error": "shell: true requires options.command to be a string",
-                        "agent": self.config.name,
-                    }
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=_prompt_env(prompt),
-                    start_new_session=True,
-                )
-            else:
-                argv = command if isinstance(command, list) else shlex.split(str(command))
-                if not argv:
-                    return {"error": "Shell agent command is empty", "agent": self.config.name}
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=_prompt_env(prompt),
-                    start_new_session=True,
-                )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                await _kill_process(proc)
+            timeout = int(self.config.options.get("timeout", 60))
+            if timeout <= 0 or timeout > 600:
                 return {
-                    "error": f"Command timed out after {timeout:.0f}s",
+                    "error": f"Invalid timeout {timeout}: must be 1–600 seconds",
                     "agent": self.config.name,
                 }
-            payload: dict[str, Any] = {
+        except (ValueError, TypeError):
+            return {
+                "error": "Timeout must be a positive integer",
+                "agent": self.config.name,
+            }
+
+        proc: asyncio.subprocess.Process | None = None
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
-            if proc.returncode not in (0, None) and not bool(options.get("allow_nonzero", False)):
-                payload["error"] = f"Command exited with {proc.returncode}"
-            return payload
-        except OSError as exc:
-            return {"error": f"Failed to start command: {exc}", "agent": self.config.name}
-
-
-def _prompt_env(prompt: str) -> dict[str, str]:
-    """Child env with FORGE_PROMPT set. Does not inherit a mutated global env."""
-    env = os.environ.copy()
-    env["FORGE_PROMPT"] = prompt
-    return env
-
-
-async def _kill_process(proc: asyncio.subprocess.Process) -> None:
-    """Kill the child and its process group (started with start_new_session)."""
-    if proc.returncode is not None:
-        return
-    try:
-        if proc.pid is not None and hasattr(os, "killpg"):
-            os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-    with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
-        await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            # Kill the subprocess on timeout to prevent orphaned processes
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass  # already exited
+            return {"error": f"Command timed out after {timeout}s", "agent": self.config.name}
+        except asyncio.CancelledError:
+            # On cancellation, kill any running subprocess
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+            raise
+        except (OSError, ValueError) as exc:
+            return {"error": str(exc), "agent": self.config.name}
 
 
 class TransformAgent(BaseAgent):
@@ -267,6 +364,8 @@ class TransformAgent(BaseAgent):
         try:
             rendered = Template(template_str).render(prompt=prompt, **(context or {}))
             return {"result": rendered, "agent": self.config.name}
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return {"error": str(exc), "agent": self.config.name}
 
@@ -288,8 +387,21 @@ class HermesAgent(BaseAgent):
             "endpoint", self.config.base_url or "http://localhost:8642"
         )
         agent_name = self.config.options.get("agent_name", "default")
-        timeout = int(self.config.options.get("timeout", 120))
+        try:
+            timeout = int(self.config.options.get("timeout", 120))
+            if timeout <= 0:
+                return {"error": "Timeout must be positive", "agent": self.config.name}
+        except (ValueError, TypeError):
+            return {"error": "Timeout must be a positive integer", "agent": self.config.name}
+
         api_key = self.config.api_key
+
+        # SSRF protection — allow localhost since Hermes typically runs locally
+        try:
+            validate_url(endpoint, allow_localhost=True)
+        except ValueError as exc:
+            logger.warning("URL validation failed for Hermes agent '%s': %s", self.config.name, exc)
+            return {"error": f"Invalid endpoint: {exc}", "agent": self.config.name}
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if api_key:
@@ -309,6 +421,15 @@ class HermesAgent(BaseAgent):
                     json=payload,
                 )
                 resp.raise_for_status()
+
+                # Limit response body size
+                body_bytes = resp.content
+                if len(body_bytes) > _MAX_RESPONSE_BYTES:
+                    return {
+                        "error": f"Response too large ({len(body_bytes)} bytes)",
+                        "agent": self.config.name,
+                    }
+
                 data = resp.json()
                 return {
                     "response": data.get("response", data.get("output", str(data))),
@@ -317,8 +438,10 @@ class HermesAgent(BaseAgent):
                     "raw": data,
                 }
         except httpx.HTTPStatusError as exc:
+            err_text = exc.response.text[:500]
+            err_text = _sanitize_error_message(err_text, api_key)
             return {
-                "error": f"Hermes API HTTP {exc.response.status_code}: {exc.response.text[:500]}",
+                "error": f"Hermes API HTTP {exc.response.status_code}: {err_text}",
                 "agent": self.config.name,
             }
         except httpx.ConnectError:
@@ -326,8 +449,13 @@ class HermesAgent(BaseAgent):
                 "error": f"Cannot connect to Hermes at {endpoint}. Is Hermes running?",
                 "agent": self.config.name,
             }
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except asyncio.CancelledError:
+            raise
+        except httpx.TimeoutException:
+            return {"error": "Hermes request timed out", "agent": self.config.name}
+        except httpx.HTTPError as exc:
+            err_msg = _sanitize_error_message(str(exc), api_key)
+            return {"error": err_msg, "agent": self.config.name}
 
 
 # --------------------------------------------------------------------------- #

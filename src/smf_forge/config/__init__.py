@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 CONFIG_FILENAME = "forge.yaml"
 
+# Maximum config file size (1 MiB) — prevents YAML bomb attacks
+_MAX_CONFIG_FILE_BYTES = 1_048_576
+
 # Regex for ${VAR} or ${VAR:default} — must match the entire string value
 _ENV_VAR_PATTERN = re.compile(r"^\$\{([^}]+)\}$")
 
@@ -84,6 +87,14 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 
     if not config_path.exists():
         raise ConfigError(f"Config file not found: {config_path}")
+
+    # Prevent YAML bomb — reject files larger than 1 MiB
+    file_size = config_path.stat().st_size
+    if file_size > _MAX_CONFIG_FILE_BYTES:
+        raise ConfigError(
+            f"Config file {config_path} is too large ({file_size} bytes, "
+            f"max {_MAX_CONFIG_FILE_BYTES})"
+        )
 
     try:
         with open(config_path, encoding="utf-8") as f:

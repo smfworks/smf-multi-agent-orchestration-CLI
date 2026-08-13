@@ -99,6 +99,15 @@ class TestLoadConfig:
         data = load_config()
         assert data["project"] == "auto"
 
+    def test_rejects_oversized_file(self, tmp_path: Path) -> None:
+        """Config files larger than 1 MiB should be rejected (YAML bomb)."""
+        path = tmp_path / CONFIG_FILENAME
+        # Create a file larger than 1 MiB
+        with open(path, "w") as f:
+            f.write("project: " + "x" * 1_048_577 + "\n")
+        with pytest.raises(ConfigError, match="too large"):
+            load_config(path)
+
 
 # --------------------------------------------------------------------------- #
 # validate_config

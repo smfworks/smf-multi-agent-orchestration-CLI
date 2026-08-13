@@ -39,12 +39,11 @@ err_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
-def _load_project_config(path: Path | None = None, *, strict_env: bool = False) -> dict[str, Any]:
+def _load_project_config(path: Path | None = None) -> dict[str, Any]:
     """Load, env-resolve, and validate config. Exits on error.
 
     Args:
         path: Optional path to forge.yaml. If ``None``, uses :func:`find_config`.
-        strict_env: When true, unset ``${VAR}`` (no default) is a config error.
 
     Returns:
         Validated config dictionary.
@@ -52,7 +51,7 @@ def _load_project_config(path: Path | None = None, *, strict_env: bool = False) 
     try:
         config_path = path or find_config()
         raw = load_config(config_path)
-        data = resolve_env_vars(raw, strict=strict_env)
+        data = resolve_env_vars(raw)
         errors = validate_config(data)
         if errors:
             err_console.print("[red]Config validation errors:[/red]")
@@ -124,7 +123,7 @@ def init(name: str, directory: str, force: bool) -> None:
     console.print(
         f"\nNext steps:\n"
         f"  1. Edit {config_path} to define your agents and pipelines\n"
-        f"  2. Run [bold]smf-forge run demo --prompt hi[/bold]"
+        f"  2. Run [bold]smf-forge run <pipeline>[/bold]"
     )
 
 
@@ -138,21 +137,29 @@ def init(name: str, directory: str, force: bool) -> None:
     help="Stop on first failure (default) or continue on error.",
 )
 @click.option("--verbose", "-v", is_flag=True, help="Show step outputs.")
+@click.option(
+    "--timeout",
+    type=float,
+    default=None,
+    help="Overall pipeline timeout in seconds.",
+)
 def run(
     pipeline_name: str,
     config_path: Path | None,
     prompt: str,
     fail_fast: bool,
     verbose: bool,
+    timeout: float | None,
 ) -> None:
     """Run a named pipeline.
 
     PIPELINE_NAME is the name of the pipeline to execute (as defined in forge.yaml).
 
-    \b
+    \\b
     Examples:
       smf-forge run research-summarize --prompt "Explain quantum computing"
       smf-forge run deploy --config ./custom.yaml --continue-on-error
+      smf-forge run long-task --timeout 300
     """
     data = _load_project_config(config_path)
     pipelines = data.get("pipelines", {})
@@ -182,10 +189,16 @@ def run(
 
     console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
 
+    # Execute with Ctrl-C / timeout handling
     try:
-        result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
-    except ValueError as exc:
-        err_console.print(f"[red]Pipeline error:[/red] {exc}")
+        result = asyncio.run(
+            engine.run(pipeline, registry, initial_context=initial_context, timeout=timeout)
+        )
+    except KeyboardInterrupt:
+        err_console.print("\n[yellow]Pipeline interrupted by user (Ctrl-C).[/yellow]")
+        sys.exit(130)  # 128 + SIGINT(2)
+    except asyncio.TimeoutError:
+        err_console.print("\n[red]Pipeline timed out.[/red]")
         sys.exit(1)
 
     engine.print_result(result)
@@ -262,8 +275,7 @@ def validate(config_path: Path | None) -> None:
                 console.print(f"  • {e}")
             sys.exit(1)
         else:
-            console.print("[green]✓ Config is valid[/green]")
-            console.print(f"  {cfg_path}")
+            console.print(f"[green]✓ {cfg_path} is valid[/green]")
             agents = raw.get("agents", {})
             pipes = raw.get("pipelines", {})
             console.print(f"  {len(agents)} agent(s), {len(pipes)} pipeline(s)")

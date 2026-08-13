@@ -318,6 +318,105 @@ class TestPipelineExecution:
 
 
 # --------------------------------------------------------------------------- #
+# Pipeline timeout and cancellation
+# --------------------------------------------------------------------------- #
+
+class TestPipelineTimeout:
+    def test_pipeline_timeout_short(self) -> None:
+        """Pipeline with a very short timeout should mark steps as TIMEOUT."""
+        config = AgentConfig(name="slow", type="echo")
+        registry: dict[str, BaseAgent] = {"slow": DelayedEchoAgent(config)}
+        pipeline = {
+            "name": "timeout-test",
+            "steps": [{"name": "s1", "agent": "slow", "prompt": "x"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry, timeout=0.001))
+        # With 1ms timeout, the 10ms delayed agent should time out
+        assert not result.success
+
+    def test_pipeline_timeout_none(self) -> None:
+        """Pipeline with no timeout should run normally."""
+        registry = build_registry({"echo1": {"type": "echo"}})
+        pipeline = {
+            "name": "no-timeout",
+            "steps": [{"name": "s1", "agent": "echo1", "prompt": "x"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry, timeout=None))
+        assert result.success
+
+    def test_pipeline_timeout_sufficient(self) -> None:
+        """Pipeline with a sufficient timeout should complete normally."""
+        registry = build_registry({"echo1": {"type": "echo"}})
+        pipeline = {
+            "name": "enough-timeout",
+            "steps": [{"name": "s1", "agent": "echo1", "prompt": "x"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry, timeout=30))
+        assert result.success
+
+    def test_pipeline_timeout_cancels_hung_agent(self) -> None:
+        """Pipeline timeout should cancel a hung agent."""
+        class HungAgent(BaseAgent):
+            async def run(self, prompt: str, context: dict[str, Any] | None = None) -> Any:
+                await asyncio.sleep(100)  # will be cancelled
+
+        config = AgentConfig(name="hung", type="echo")
+        registry: dict[str, BaseAgent] = {"hung": HungAgent(config)}
+        pipeline = {
+            "name": "hung-test",
+            "steps": [{"name": "s1", "agent": "hung", "prompt": "x"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry, timeout=0.1))
+        assert not result.success
+
+    def test_timeout_status_in_results(self) -> None:
+        """When pipeline times out, steps should have TIMEOUT status."""
+        class HungAgent(BaseAgent):
+            async def run(self, prompt: str, context: dict[str, Any] | None = None) -> Any:
+                await asyncio.sleep(100)
+
+        config = AgentConfig(name="hung", type="echo")
+        registry: dict[str, BaseAgent] = {"hung": HungAgent(config)}
+        pipeline = {
+            "name": "timeout-status",
+            "steps": [{"name": "s1", "agent": "hung", "prompt": "x"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry, timeout=0.05))
+        assert any(s.status == StepStatus.TIMEOUT for s in result.steps)
+
+
+class TestPipelineCancellation:
+    def test_cancelled_step_does_not_hang(self) -> None:
+        """A cancelled step should not cause the pipeline to hang."""
+        class SlowAgent(BaseAgent):
+            async def run(self, prompt: str, context: dict[str, Any] | None = None) -> Any:
+                try:
+                    await asyncio.sleep(0.5)
+                    return {"echo": prompt}
+                except asyncio.CancelledError:
+                    raise
+
+        config = AgentConfig(name="slow", type="echo")
+        registry: dict[str, BaseAgent] = {"slow": SlowAgent(config)}
+        pipeline = {
+            "name": "cancel-test",
+            "steps": [
+                {"name": "s1", "agent": "slow", "prompt": "x"},
+                {"name": "s2", "agent": "slow", "prompt": "y", "depends_on": ["s1"]},
+            ],
+        }
+        engine = PipelineEngine()
+        # Use a short timeout to trigger cancellation
+        result = asyncio.run(engine.run(pipeline, registry, timeout=0.1))
+        assert not result.success
+
+
+# --------------------------------------------------------------------------- #
 # Agent builder
 # --------------------------------------------------------------------------- #
 

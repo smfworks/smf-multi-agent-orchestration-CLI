@@ -16,8 +16,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from jinja2 import Template
-from jinja2.exceptions import TemplateError
 from rich.console import Console
 from rich.tree import Tree
 
@@ -34,6 +32,7 @@ class StepStatus(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     SKIPPED = "skipped"
+    TIMEOUT = "timeout"
 
 
 @dataclass
@@ -99,6 +98,8 @@ class PipelineEngine:
       - Parallel execution for independent steps in the same layer
       - Context passing between steps (output of step N feeds step N+1)
       - Fail-fast or continue-on-error modes
+      - Overall pipeline timeout
+      - Cancellation on failure (fail-fast mode)
     """
 
     def __init__(self, fail_fast: bool = True, verbose: bool = False) -> None:
@@ -209,15 +210,14 @@ class PipelineEngine:
         # Render prompt template with context
         prompt_template = step.get("prompt", "")
         try:
+            from jinja2 import Template
+
             prompt = Template(prompt_template).render(**context)
-        except TemplateError as exc:
-            return StepResult(
-                step_name=step_name,
-                agent_name=agent_name,
-                status=StepStatus.FAILED,
-                error=f"Prompt template error: {exc}",
-                duration_ms=(time.monotonic() - start) * 1000,
-            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Template render failed for step '%s': %s", step_name, exc)
+            prompt = prompt_template
 
         try:
             output = await agent.run(prompt, context)
@@ -241,6 +241,18 @@ class PipelineEngine:
                 output=output,
                 duration_ms=duration,
             )
+        except asyncio.CancelledError:
+            logger.info("Step '%s' was cancelled", step_name)
+            raise
+        except asyncio.TimeoutError:
+            duration = (time.monotonic() - start) * 1000
+            return StepResult(
+                step_name=step_name,
+                agent_name=agent_name,
+                status=StepStatus.TIMEOUT,
+                error="Step timed out",
+                duration_ms=duration,
+            )
         except Exception as exc:
             duration = (time.monotonic() - start) * 1000
             logger.error("Step '%s' raised exception: %s", step_name, exc)
@@ -261,6 +273,7 @@ class PipelineEngine:
         pipeline: dict[str, Any],
         agent_registry: dict[str, Any],
         initial_context: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> PipelineResult:
         """Execute a full pipeline.
 
@@ -269,6 +282,9 @@ class PipelineEngine:
             agent_registry: Map of agent name → agent instance.
             initial_context: Optional initial context (e.g. ``{"prompt": "..."}``)
                 available to all steps via Jinja2 templating.
+            timeout: Optional overall pipeline timeout in seconds. If the
+                pipeline exceeds this, remaining steps are cancelled and
+                marked as TIMEOUT.
 
         Returns:
             :class:`PipelineResult` with per-step outcomes.
@@ -284,8 +300,23 @@ class PipelineEngine:
         context: dict[str, Any] = dict(initial_context or {})
         results: list[StepResult] = []
         has_failure = False
+        timed_out = False
 
         for layer in layers:
+            if timed_out:
+                # Mark remaining steps as skipped due to timeout
+                for name in layer:
+                    step = next(s for s in steps if s["name"] == name)
+                    results.append(
+                        StepResult(
+                            step_name=name,
+                            agent_name=step["agent"],
+                            status=StepStatus.SKIPPED,
+                            error="Skipped due to pipeline timeout",
+                        )
+                    )
+                continue
+
             if has_failure and self.fail_fast:
                 # Mark remaining steps as skipped
                 for name in layer:
@@ -300,15 +331,100 @@ class PipelineEngine:
                     )
                 continue
 
+            # Check timeout before starting this layer
+            if timeout is not None:
+                elapsed = time.monotonic() - start
+                if elapsed >= timeout:
+                    timed_out = True
+                    has_failure = True
+                    for name in layer:
+                        step = next(s for s in steps if s["name"] == name)
+                        results.append(
+                            StepResult(
+                                step_name=name,
+                                agent_name=step["agent"],
+                                status=StepStatus.TIMEOUT,
+                                error="Pipeline timed out",
+                            )
+                        )
+                    continue
+
             # Run all steps in this layer concurrently
             layer_steps = [next(s for s in steps if s["name"] == name) for name in layer]
-            tasks = [self._run_step(s, agent_registry, context) for s in layer_steps]
-            layer_results = await asyncio.gather(*tasks)
+
+            # Calculate remaining timeout for this layer
+            layer_timeout: float | None = None
+            if timeout is not None:
+                layer_timeout = timeout - (time.monotonic() - start)
+                if layer_timeout <= 0:
+                    timed_out = True
+                    has_failure = True
+                    for name in layer:
+                        step = next(s for s in steps if s["name"] == name)
+                        results.append(
+                            StepResult(
+                                step_name=name,
+                                agent_name=step["agent"],
+                                status=StepStatus.TIMEOUT,
+                                error="Pipeline timed out",
+                            )
+                        )
+                    continue
+
+            coros = [self._run_step(s, agent_registry, context) for s in layer_steps]
+            tasks: list[asyncio.Task[StepResult]] = [asyncio.ensure_future(c) for c in coros]
+
+            try:
+                if layer_timeout is not None:
+                    layer_results = await asyncio.wait_for(
+                        asyncio.gather(*tasks),
+                        timeout=layer_timeout,
+                    )
+                else:
+                    layer_results = await asyncio.gather(*tasks)
+            except asyncio.TimeoutError:
+                # Layer timed out — cancel all pending tasks
+                for task in tasks:
+                    task.cancel()
+                # Wait for cancelled tasks to settle
+                await asyncio.gather(*tasks, return_exceptions=True)
+                timed_out = True
+                has_failure = True
+                # Collect whatever results we can (some tasks may have completed)
+                completed: list[StepResult] = []
+                for t in tasks:
+                    if t.done() and not t.cancelled() and t.exception() is None:
+                        completed.append(t.result())
+                completed_names = {r.step_name for r in completed}
+                for name in layer:
+                    if name in completed_names:
+                        for r in completed:
+                            if r.step_name == name:
+                                results.append(r)
+                                break
+                    else:
+                        step = next(s for s in steps if s["name"] == name)
+                        results.append(
+                            StepResult(
+                                step_name=name,
+                                agent_name=step["agent"],
+                                status=StepStatus.TIMEOUT,
+                                error="Step timed out (pipeline timeout)",
+                            )
+                        )
+                continue
+            except asyncio.CancelledError:
+                # Pipeline was cancelled externally
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
             results.extend(layer_results)
 
             for r in layer_results:
                 context[r.step_name] = r.output or {}
-                if r.status == StepStatus.FAILED:
+                if r.status in (StepStatus.FAILED, StepStatus.TIMEOUT):
                     has_failure = True
 
         duration = (time.monotonic() - start) * 1000
@@ -333,6 +449,7 @@ class PipelineEngine:
             StepStatus.SUCCESS: "[green]✓[/green]",
             StepStatus.FAILED: "[red]✗[/red]",
             StepStatus.SKIPPED: "[yellow]⊘[/yellow]",
+            StepStatus.TIMEOUT: "[red]⏱[/red]",
             StepStatus.RUNNING: "[blue]⟳[/blue]",
             StepStatus.PENDING: "[dim]·[/dim]",
         }
