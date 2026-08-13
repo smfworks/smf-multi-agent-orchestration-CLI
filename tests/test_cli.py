@@ -16,7 +16,8 @@ def test_help():
     assert "run" in result.output
 
 
-def test_init_validate_run_without_secrets(tmp_path: Path):
+def test_init_validate_run_without_secrets(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "40")
     runner = CliRunner()
     init = runner.invoke(main, ["init", "--name", "smoke", "--directory", str(tmp_path)])
     assert init.exit_code == 0
@@ -24,7 +25,9 @@ def test_init_validate_run_without_secrets(tmp_path: Path):
 
     validate = runner.invoke(main, ["validate", "--config", str(tmp_path / "forge.yaml")])
     assert validate.exit_code == 0
-    assert "is valid" in validate.output
+    collapsed = " ".join(validate.output.split())
+    assert "Config is valid" in collapsed
+    assert "1 agent" in collapsed
 
     agents = runner.invoke(main, ["agents", "--config", str(tmp_path / "forge.yaml")])
     assert agents.exit_code == 0
@@ -47,3 +50,35 @@ def test_run_missing_pipeline(tmp_path: Path):
     result = runner.invoke(main, ["run", "nope", "--config", str(tmp_path / "forge.yaml")])
     assert result.exit_code == 1
     assert "not found" in result.output
+
+
+def test_validate_missing_config(tmp_path: Path):
+    runner = CliRunner()
+    result = runner.invoke(main, ["validate", "--config", str(tmp_path / "missing.yaml")])
+    assert result.exit_code == 1
+    assert "not found" in result.output.lower()
+
+
+def test_validate_cycle(tmp_path: Path):
+    (tmp_path / "forge.yaml").write_text(
+        "agents:\n  echo:\n    type: echo\n"
+        "pipelines:\n  loop:\n    name: loop\n    steps:\n"
+        "      - name: a\n        agent: echo\n        depends_on: [b]\n"
+        "      - name: b\n        agent: echo\n        depends_on: [a]\n"
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["run", "loop", "--config", str(tmp_path / "forge.yaml")])
+    assert result.exit_code == 1
+    assert "circular" in result.output.lower()
+
+
+def test_version_matches_package():
+    from importlib.metadata import version
+
+    from smf_forge import __version__
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["--version"])
+    assert result.exit_code == 0
+    assert __version__ in result.output
+    assert version("smf-forge") == __version__

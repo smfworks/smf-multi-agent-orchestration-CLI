@@ -9,6 +9,7 @@ from smf_forge.agents import (
     BaseAgent,
     EchoAgent,
     HermesAgent,
+    ShellAgent,
     build_agent,
     build_registry,
 )
@@ -161,6 +162,24 @@ class TestPipelineExecution:
         assert not result.success
         assert result.steps[0].status == StepStatus.FAILED
         assert "No API key" in result.steps[0].error
+
+    def test_shell_nonzero_fails_pipeline(self):
+        agent = ShellAgent(
+            AgentConfig(
+                name="sh",
+                type="shell",
+                options={"command": ["python3", "-c", "raise SystemExit(3)"]},
+            )
+        )
+        pipeline = {
+            "name": "sh-fail",
+            "steps": [{"name": "cmd", "agent": "sh", "prompt": "x"}],
+        }
+        result = asyncio.run(PipelineEngine().run(pipeline, {"sh": agent}))
+        assert not result.success
+        assert result.steps[0].status == StepStatus.FAILED
+        assert result.steps[0].error is not None
+        assert "exited with 3" in result.steps[0].error
 
     def test_bad_template_fails_step(self):
         registry = build_registry({"echo1": {"type": "echo"}})

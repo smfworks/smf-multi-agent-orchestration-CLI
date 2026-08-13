@@ -86,6 +86,43 @@ def test_shell_agent_does_not_run_prompt():
     assert "should-not-run" not in result.get("stdout", "")
 
 
+def test_shell_agent_nonzero_is_error():
+    agent = ShellAgent(
+        AgentConfig(
+            name="s",
+            type="shell",
+            options={"command": ["python3", "-c", "raise SystemExit(7)"]},
+        )
+    )
+    result = asyncio.run(agent.run("x"))
+    assert result["exit_code"] == 7
+    assert "exited with 7" in result["error"]
+
+
+def test_shell_agent_allow_nonzero():
+    agent = ShellAgent(
+        AgentConfig(
+            name="s",
+            type="shell",
+            options={
+                "command": ["python3", "-c", "raise SystemExit(7)"],
+                "allow_nonzero": True,
+            },
+        )
+    )
+    result = asyncio.run(agent.run("x"))
+    assert result["exit_code"] == 7
+    assert "error" not in result
+
+
+def test_shell_true_requires_string():
+    agent = ShellAgent(
+        AgentConfig(name="s", type="shell", options={"command": ["true"], "shell": True})
+    )
+    result = asyncio.run(agent.run("x"))
+    assert "to be a string" in result["error"]
+
+
 def test_shell_agent_timeout_kills():
     agent = ShellAgent(
         AgentConfig(

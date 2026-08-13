@@ -91,6 +91,7 @@ agents:
       command: ["echo", "hello"]    # shell: argv (preferred)
       shell: false                  # set true only for trusted static strings
       timeout: 60
+      allow_nonzero: false          # default: nonzero exit fails the step
       template: "{{ data }}"        # transform
       agent_name: default           # hermes
       endpoint: http://localhost:8642

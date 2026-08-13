@@ -133,7 +133,11 @@ def run(
     if not as_json:
         console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
 
-    result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
+    try:
+        result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
+    except ValueError as exc:
+        err_console.print(f"[red]Pipeline error:[/red] {exc}")
+        sys.exit(1)
 
     if as_json:
         click.echo(json.dumps(result.to_dict(), default=str))
@@ -202,7 +206,8 @@ def validate(config_path: Path | None):
             for e in errors:
                 console.print(f"  • {e}")
             sys.exit(1)
-        console.print(f"[green]✓ {cfg_path} is valid[/green]")
+        console.print("[green]✓ Config is valid[/green]")
+        console.print(f"  {cfg_path}")
         agents = raw.get("agents", {})
         pipes = raw.get("pipelines", {})
         console.print(f"  {len(agents)} agent(s), {len(pipes)} pipeline(s)")

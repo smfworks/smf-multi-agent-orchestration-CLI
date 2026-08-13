@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
+import signal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -127,6 +129,7 @@ class ShellAgent(BaseAgent):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=_prompt_env(prompt),
+                    start_new_session=True,
                 )
             else:
                 argv = command if isinstance(command, list) else shlex.split(str(command))
@@ -137,6 +140,7 @@ class ShellAgent(BaseAgent):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=_prompt_env(prompt),
+                    start_new_session=True,
                 )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -146,32 +150,44 @@ class ShellAgent(BaseAgent):
                     "error": f"Command timed out after {timeout:.0f}s",
                     "agent": self.config.name,
                 }
-            return {
+            payload = {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
+            allow_nonzero = bool(options.get("allow_nonzero", False))
+            if proc.returncode not in (0, None) and not allow_nonzero:
+                payload["error"] = f"Command exited with {proc.returncode}"
+            return payload
         except OSError as exc:
             return {"error": f"Failed to start command: {exc}", "agent": self.config.name}
 
 
 def _prompt_env(prompt: str) -> dict[str, str]:
     """Child env with FORGE_PROMPT set. Does not inherit a mutated global env."""
-    import os
-
     env = os.environ.copy()
     env["FORGE_PROMPT"] = prompt
     return env
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill the child and its process group (started with start_new_session)."""
     if proc.returncode is not None:
         return
-    proc.kill()
+    try:
+        if proc.pid is not None and hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
     try:
         await asyncio.wait_for(proc.communicate(), timeout=5)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, ProcessLookupError):
         pass
 
 

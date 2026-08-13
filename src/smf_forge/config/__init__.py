@@ -33,8 +33,15 @@ def find_config(start: Path | None = None) -> Path:
 def load_config(path: Path | None = None) -> dict[str, Any]:
     """Load and parse a forge.yaml config file."""
     config_path = path or find_config()
-    with open(config_path) as f:
-        data = yaml.safe_load(f)
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file not found: {config_path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Failed to read {config_path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in {config_path}: {exc}") from exc
 
     if not isinstance(data, dict):
         raise ConfigError(f"{config_path} must contain a YAML mapping")
@@ -122,7 +129,39 @@ def validate_config(data: dict[str, Any]) -> list[str]:
                         f"Pipeline '{pname}' step '{sname}' depends on unknown step '{dep}'"
                     )
 
+        if _pipeline_has_cycle(parsed_steps, step_names):
+            errors.append(f"Pipeline '{pname}' has circular dependencies")
+
     return errors
+
+
+def _pipeline_has_cycle(parsed_steps: list[tuple[str, dict]], step_names: set[str]) -> bool:
+    """True if named steps contain a dependency cycle (including self-edges)."""
+    deps_map: dict[str, list[str]] = {}
+    for sname, step in parsed_steps:
+        depends = step.get("depends_on", [])
+        if not isinstance(depends, list):
+            deps_map[sname] = []
+            continue
+        deps_map[sname] = [d for d in depends if d in step_names]
+
+    visited: set[str] = set()
+    stack: set[str] = set()
+
+    def cyclic(node: str) -> bool:
+        if node in stack:
+            return True
+        if node in visited:
+            return False
+        visited.add(node)
+        stack.add(node)
+        for dep in deps_map.get(node, []):
+            if cyclic(dep):
+                return True
+        stack.remove(node)
+        return False
+
+    return any(cyclic(name) for name in deps_map)
 
 
 def resolve_env_vars(data: dict[str, Any], *, strict: bool = True) -> dict[str, Any]:

@@ -25,16 +25,17 @@ forge.yaml  →  config.load / validate / resolve_env
 
 ## Execution model
 
-1. Validate names, types, agent refs, and `depends_on` before run.
+1. Validate names, types, agent refs, `depends_on`, and cycles before run.
 2. Kahn layers: a layer is the set of steps with no remaining deps.
 3. Steps in a layer run concurrently via `asyncio.gather`.
 4. Each step output is stored on the context under the step name.
-5. Agent `{error: ...}` dicts without a `response` key are failures.
+5. Agent `{error: ...}` dicts without a `response` key are failures. Shell nonzero exit is an error unless `allow_nonzero`.
 6. Prompt template errors fail the step. They do not fall back to raw text.
 
 ## Trust boundary
 
 - Config and templates are local operator input.
 - `shell` agents execute only `options.command`. The step prompt is never the command. It is exported as `FORGE_PROMPT` for commands that opt in to reading it.
+- Nonzero exit fails the step unless `options.allow_nonzero` is true. Timeouts kill the process group.
 - `shell: true` is an explicit escape hatch for a trusted static string.
 - HTTP and Hermes calls send the rendered prompt to the configured endpoint. Secrets belong in env vars, not in the repo.

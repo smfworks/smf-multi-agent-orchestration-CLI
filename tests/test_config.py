@@ -49,6 +49,16 @@ class TestLoadConfig:
         with pytest.raises(ConfigError, match="YAML mapping"):
             load_config(path)
 
+    def test_rejects_missing_file(self, tmp_path):
+        with pytest.raises(ConfigError, match="not found"):
+            load_config(tmp_path / "missing.yaml")
+
+    def test_rejects_invalid_yaml(self, tmp_path):
+        path = tmp_path / "forge.yaml"
+        path.write_text("agents: [\n")
+        with pytest.raises(ConfigError, match="Invalid YAML"):
+            load_config(path)
+
 
 class TestValidateConfig:
     def test_valid_config(self):
@@ -100,6 +110,35 @@ class TestValidateConfig:
         }
         errors = validate_config(data)
         assert any("unknown step 'ghost'" in e for e in errors)
+
+    def test_circular_dependency(self):
+        data = {
+            "agents": {"echo": {"type": "echo"}},
+            "pipelines": {
+                "loop": {
+                    "steps": [
+                        {"name": "a", "agent": "echo", "depends_on": ["b"]},
+                        {"name": "b", "agent": "echo", "depends_on": ["a"]},
+                    ]
+                }
+            },
+        }
+        errors = validate_config(data)
+        assert any("circular" in e for e in errors)
+
+    def test_self_dependency(self):
+        data = {
+            "agents": {"echo": {"type": "echo"}},
+            "pipelines": {
+                "loop": {
+                    "steps": [
+                        {"name": "a", "agent": "echo", "depends_on": ["a"]},
+                    ]
+                }
+            },
+        }
+        errors = validate_config(data)
+        assert any("circular" in e for e in errors)
 
     def test_duplicate_step_names(self):
         data = {
