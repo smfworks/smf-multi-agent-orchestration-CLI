@@ -35,7 +35,7 @@ forge.yaml  →  config.load / validate / resolve_env
 ## Trust boundary
 
 - Config and templates are local operator input.
-- `shell` agents execute only `options.command`. The step prompt is never the command. It is exported as `FORGE_PROMPT` for commands that opt in to reading it.
+- `shell` agents execute only `options.command` as argv. The step prompt is never the command, never in the child environment, and never interpolated.
 - Nonzero exit fails the step unless `options.allow_nonzero` is true. Timeouts kill the process group.
-- `shell: true` is an explicit escape hatch for a trusted static string.
+- `shell: true` and `create_subprocess_shell` are not supported.
 - HTTP and Hermes calls send the rendered prompt to the configured endpoint. Secrets belong in env vars, not in the repo.

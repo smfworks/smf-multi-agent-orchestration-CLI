@@ -142,7 +142,7 @@ class HttpAgent(BaseAgent):
         messages.append({"role": "user", "content": prompt})
 
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(timeout=120, trust_env=False, follow_redirects=False) as client:
                 resp = await client.post(
                     f"{base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -169,50 +169,43 @@ class HttpAgent(BaseAgent):
 
 
 class ShellAgent(BaseAgent):
-    """Runs a configured command and returns stdout/stderr/exit code.
-
-    Security: the command comes from agent options, never from the step prompt.
-    ``shell: false`` (default) uses argv execution. ``shell: true`` is opt-in
-    and must be a trusted static string.
-    """
+    """Runs a configured argv command. The step prompt is never executed or exported."""
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
+        del prompt, context
         options = self.config.options or {}
         command = options.get("command")
-        if not command:
+        if options.get("shell") not in (None, False):
             return {
-                "error": "Shell agent requires options.command; the prompt is never executed",
+                "error": "shell: true is not supported; use an argv list in options.command",
                 "agent": self.config.name,
             }
+        if isinstance(command, list) and command and all(isinstance(x, str) for x in command):
+            argv = command
+        elif isinstance(command, str) and command.strip():
+            if any(token in command for token in ("$", "`", "$(")):
+                return {
+                    "error": "shell agent command string must not contain $, ` or $(",
+                    "agent": self.config.name,
+                }
+            argv = shlex.split(command, posix=os.name != "nt")
+        else:
+            return {
+                "error": "shell agent requires options.command (argv list or string); refusing to execute the prompt",
+                "agent": self.config.name,
+            }
+        if not argv:
+            return {"error": "shell agent options.command is empty after parse", "agent": self.config.name}
 
-        use_shell = bool(options.get("shell", False))
         timeout = float(options.get("timeout", 60))
-
+        proc = None
         try:
-            if use_shell:
-                if not isinstance(command, str):
-                    return {
-                        "error": "shell: true requires options.command to be a string",
-                        "agent": self.config.name,
-                    }
-                proc = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=_prompt_env(prompt),
-                    start_new_session=True,
-                )
-            else:
-                argv = command if isinstance(command, list) else shlex.split(str(command))
-                if not argv:
-                    return {"error": "Shell agent command is empty", "agent": self.config.name}
-                proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=_prompt_env(prompt),
-                    start_new_session=True,
-                )
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             except asyncio.TimeoutError:
@@ -232,13 +225,6 @@ class ShellAgent(BaseAgent):
             return payload
         except OSError as exc:
             return {"error": f"Failed to start command: {exc}", "agent": self.config.name}
-
-
-def _prompt_env(prompt: str) -> dict[str, str]:
-    """Child env with FORGE_PROMPT set. Does not inherit a mutated global env."""
-    env = os.environ.copy()
-    env["FORGE_PROMPT"] = prompt
-    return env
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:
@@ -316,7 +302,7 @@ class HermesAgent(BaseAgent):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False) as client:
                 resp = await client.post(
                     f"{endpoint}/api/agent/run",
                     headers=headers,

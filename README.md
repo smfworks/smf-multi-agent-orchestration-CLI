@@ -117,7 +117,7 @@ smf-forge run research-summarize --prompt "Explain quantum computing"
 |------|-------------|------------|
 | `echo` | Returns the input — useful for testing pipelines | — |
 | `http` | Calls an OpenAI-compatible chat completions endpoint | `model`, `base_url`, `api_key` |
-| `shell` | Runs a **configured** command (never the prompt). Argv by default | `options.command`, optional `shell: true` |
+| `shell` | Runs a **configured** argv command (never the prompt, never in env) | `options.command` |
 | `transform` | Applies a Jinja2 template to context data | `options.template` |
 | `hermes` | Calls a Hermes/OpenClaw-compatible agent endpoint | `options.endpoint`, `options.agent_name` |
 
