@@ -6,11 +6,7 @@ SMF Forge lets you declare agents and pipelines in a simple `forge.yaml` file, t
 
 ## Install
 
-```bash
-pip install smf-forge
-```
-
-Or from source:
+This package is **source-first**. There is no PyPI release yet.
 
 ```bash
 git clone https://github.com/smfworks/smf-multi-agent-orchestration-CLI.git
@@ -26,11 +22,17 @@ pip install -e ".[dev]"
 smf-forge init --name my-project
 ```
 
-This creates a `forge.yaml` template in the current directory.
+This writes an echo-only `forge.yaml`. No API keys required.
 
-### 2. Define agents and pipelines
+### 2. Run the default pipeline
 
-Edit `forge.yaml`:
+```bash
+smf-forge run greet --prompt "Explain quantum computing"
+```
+
+### 3. Optional: HTTP pipelines
+
+Add `http` agents when you have a key. Example:
 
 ```yaml
 agents:
@@ -63,8 +65,6 @@ pipelines:
           - research
 ```
 
-### 3. Run a pipeline
-
 ```bash
 smf-forge run research-summarize --prompt "Explain quantum computing"
 ```
@@ -75,8 +75,9 @@ smf-forge run research-summarize --prompt "Explain quantum computing"
 |------|-------------|
 | `echo` | Returns the input — useful for testing pipelines |
 | `http` | Calls an OpenAI-compatible chat completions endpoint |
-| `shell` | Runs a shell command and returns stdout |
-| `transform` | Applies a Jinja2 template to context data |
+| `shell` | Runs `options.command` only (never the prompt) |
+| `transform` | Applies a sandboxed Jinja2 template to context data |
+| `hermes` | Calls a local Hermes `/api/agent/run` endpoint |
 
 ## CLI Commands
 
@@ -134,8 +135,11 @@ pipelines:
 
 ```bash
 pip install -e ".[dev]"
-pytest
+python -m pytest -q
+python -m ruff check src tests
 ```
+
+See [SECURITY.md](SECURITY.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

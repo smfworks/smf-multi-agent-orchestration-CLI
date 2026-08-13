@@ -31,8 +31,13 @@ def find_config(start: Path | None = None) -> Path:
 def load_config(path: Path | None = None) -> dict[str, Any]:
     """Load and parse a forge.yaml config file."""
     config_path = path or find_config()
-    with open(config_path) as f:
-        data = yaml.safe_load(f)
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in {config_path}: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read {config_path}: {exc}") from exc
 
     if not isinstance(data, dict):
         raise ConfigError(f"{config_path} must contain a YAML mapping")
@@ -56,6 +61,14 @@ def validate_config(data: dict[str, Any]) -> list[str]:
             agent_type = cfg.get("type")
             if not agent_type:
                 errors.append(f"Agent '{name}' missing required 'type' field")
+            else:
+                from smf_forge.agents import AGENT_TYPES
+
+                if agent_type not in AGENT_TYPES:
+                    errors.append(
+                        f"Agent '{name}' has unknown type '{agent_type}' "
+                        f"(known: {', '.join(sorted(AGENT_TYPES))})"
+                    )
 
     # Check pipelines section
     pipelines = data.get("pipelines", {})
@@ -74,7 +87,7 @@ def validate_config(data: dict[str, Any]) -> list[str]:
                 errors.append(f"Pipeline '{pname}' has no steps")
                 continue
 
-            step_names = set()
+            step_names: set[str] = set()
             for i, step in enumerate(steps):
                 if not isinstance(step, dict):
                     errors.append(f"Pipeline '{pname}' step {i} must be a mapping")
@@ -90,11 +103,27 @@ def validate_config(data: dict[str, Any]) -> list[str]:
                 agent_ref = step.get("agent")
                 if not agent_ref:
                     errors.append(f"Pipeline '{pname}' step '{sname}' missing 'agent' reference")
+                elif isinstance(agents, dict) and agent_ref not in agents:
+                    errors.append(
+                        f"Pipeline '{pname}' step '{sname}' references unknown agent '{agent_ref}'"
+                    )
 
-                # Check depends_on references
                 depends = step.get("depends_on", [])
                 if not isinstance(depends, list):
                     errors.append(f"Pipeline '{pname}' step '{sname}' depends_on must be a list")
+
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                depends = step.get("depends_on", [])
+                if not isinstance(depends, list):
+                    continue
+                sname = step.get("name")
+                for dep in depends:
+                    if dep not in step_names:
+                        errors.append(
+                            f"Pipeline '{pname}' step '{sname}' depends_on unknown step '{dep}'"
+                        )
 
     return errors
 

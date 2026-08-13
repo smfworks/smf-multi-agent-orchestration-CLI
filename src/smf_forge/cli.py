@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 
 import click
-import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -22,7 +21,7 @@ from smf_forge.config import (
     resolve_env_vars,
     validate_config,
 )
-from smf_forge.engine import PipelineEngine, StepStatus
+from smf_forge.engine import PipelineEngine
 
 console = Console()
 err_console = Console(stderr=True)
@@ -53,7 +52,6 @@ def main():
 
     Define agents and pipelines in forge.yaml, then run them.
     """
-    pass
 
 
 @main.command()
@@ -118,8 +116,11 @@ def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bo
 
     console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
 
-    # Pass initial context to engine so steps can reference {{ prompt }}
-    result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
+    try:
+        result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
+    except ValueError as exc:
+        err_console.print(f"[red]Pipeline error:[/red] {exc}")
+        sys.exit(1)
 
     engine.print_result(result)
 

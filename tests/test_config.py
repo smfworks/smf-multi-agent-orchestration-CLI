@@ -1,7 +1,5 @@
 """Tests for smf-forge config module."""
 
-import os
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -119,6 +117,36 @@ class TestValidateConfig:
         }
         errors = validate_config(data)
         assert any("depends_on must be a list" in e for e in errors)
+
+    def test_unknown_agent_type(self):
+        data = {"agents": {"bot": {"type": "not-a-real-type"}}}
+        errors = validate_config(data)
+        assert any("unknown type" in e for e in errors)
+
+    def test_unknown_agent_ref_and_dep(self):
+        data = {
+            "agents": {"echo": {"type": "echo"}},
+            "pipelines": {
+                "bad": {
+                    "steps": [
+                        {
+                            "name": "s1",
+                            "agent": "missing-agent",
+                            "depends_on": ["ghost"],
+                        }
+                    ]
+                }
+            },
+        }
+        errors = validate_config(data)
+        assert any("unknown agent" in e for e in errors)
+        assert any("unknown step" in e for e in errors)
+
+    def test_invalid_yaml_is_config_error(self, tmp_dir):
+        path = tmp_dir / "forge.yaml"
+        path.write_text("agents: [\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="Invalid YAML"):
+            load_config(path)
 
 
 class TestResolveEnvVars:

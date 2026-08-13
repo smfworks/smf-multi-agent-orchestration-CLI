@@ -139,11 +139,20 @@ class PipelineEngine:
         # Render prompt template with context
         prompt_template = step.get("prompt", "")
         try:
-            from jinja2 import Template
+            from jinja2 import StrictUndefined
+            from jinja2.sandbox import SandboxedEnvironment
 
-            prompt = Template(prompt_template).render(**context)
-        except Exception:
-            prompt = prompt_template
+            prompt = SandboxedEnvironment(undefined=StrictUndefined).from_string(
+                prompt_template
+            ).render(**context)
+        except Exception as exc:
+            return StepResult(
+                step_name=step["name"],
+                agent_name=agent_name,
+                status=StepStatus.FAILED,
+                error=f"prompt template failed: {exc}",
+                duration_ms=(time.monotonic() - start) * 1000,
+            )
 
         try:
             output = await agent.run(prompt, context)

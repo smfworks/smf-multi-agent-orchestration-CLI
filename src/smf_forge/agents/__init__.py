@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import os
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -88,41 +89,67 @@ class HttpAgent(BaseAgent):
 
 
 class ShellAgent(BaseAgent):
-    """Runs a shell command and returns stdout."""
+    """Runs a configured shell command and returns stdout.
+
+    Fail-closed: the command MUST be set in ``options.command``.
+    The step prompt is never executed as a shell string.
+    """
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
-        command = self.config.options.get("command", prompt)
+        command = self.config.options.get("command")
+        if isinstance(command, list) and all(isinstance(x, str) for x in command) and command:
+            argv = command
+        elif isinstance(command, str) and command.strip():
+            argv = shlex.split(command, posix=os.name != "nt")
+        else:
+            return {
+                "error": "shell agent requires options.command (argv list or string); refusing to execute the prompt",
+                "agent": self.config.name,
+            }
+        if not argv:
+            return {
+                "error": "shell agent options.command is empty after parse",
+                "agent": self.config.name,
+            }
+        proc = None
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-            return {
+            payload = {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
+            if proc.returncode != 0:
+                payload["error"] = f"command exited {proc.returncode}"
+            return payload
         except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
             return {"error": "Command timed out after 60s", "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except Exception:
+            return {"error": "shell agent failed", "agent": self.config.name}
 
 
 class TransformAgent(BaseAgent):
     """Applies a Jinja2 template transform to context data."""
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
-        from jinja2 import Template
+        from jinja2.sandbox import SandboxedEnvironment
 
         template_str = self.config.options.get("template", "{{ prompt }}")
         try:
-            rendered = Template(template_str).render(prompt=prompt, **(context or {}))
+            env = SandboxedEnvironment()
+            rendered = env.from_string(template_str).render(prompt=prompt, **(context or {}))
             return {"result": rendered, "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except Exception:
+            return {"error": "transform template failed", "agent": self.config.name}
 
 
 class HermesAgent(BaseAgent):
