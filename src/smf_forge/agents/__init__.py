@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -160,32 +162,53 @@ class HttpAgent(BaseAgent):
 
 
 class ShellAgent(BaseAgent):
-    """Runs a shell command and returns stdout/stderr/exit code.
+    """Runs a configured command and returns stdout/stderr/exit code.
 
-    The command is taken from ``config.options['command']`` if set, otherwise
-    the rendered prompt is used as the command.
+    Fail-closed: ``options.command`` is required (argv list or string).
+    The step prompt is never executed.
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        command = self.config.options.get("command", prompt)
+        command = self.config.options.get("command")
         timeout = int(self.config.options.get("timeout", 60))
+        if isinstance(command, list) and all(isinstance(x, str) for x in command) and command:
+            argv = command
+        elif isinstance(command, str) and command.strip():
+            argv = shlex.split(command, posix=os.name != "nt")
+        else:
+            return {
+                "error": "shell agent requires options.command (argv list or string); refusing to execute the prompt",
+                "agent": self.config.name,
+            }
+        if not argv:
+            return {
+                "error": "shell agent options.command is empty after parse",
+                "agent": self.config.name,
+            }
+        proc = None
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return {
+            payload: dict[str, Any] = {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
+            if proc.returncode != 0:
+                payload["error"] = f"command exited {proc.returncode}"
+            return payload
         except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
             return {"error": f"Command timed out after {timeout}s", "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except Exception:
+            return {"error": "shell agent failed", "agent": self.config.name}
 
 
 class TransformAgent(BaseAgent):
