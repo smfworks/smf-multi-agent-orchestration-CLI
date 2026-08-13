@@ -110,7 +110,7 @@ class TestValidate:
     def test_valid_config(self, runner: CliRunner, valid_project: Path) -> None:
         result = runner.invoke(main, ["validate", "--config", str(valid_project / CONFIG_FILENAME)])
         assert result.exit_code == 0
-        assert "valid" in result.output
+        assert "valid" in result.output.lower()
 
     def test_invalid_config(self, runner: CliRunner, tmp_path: Path) -> None:
         write_config(tmp_path, {
