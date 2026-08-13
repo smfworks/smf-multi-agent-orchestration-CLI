@@ -1,8 +1,16 @@
-"""Pipeline engine — executes agent DAGs with dependency resolution."""
+"""Pipeline engine — executes agent DAGs with dependency resolution.
+
+Provides:
+  - StepStatus: enum for step lifecycle states
+  - StepResult: dataclass for a single step's output
+  - PipelineResult: aggregated output from a full pipeline run
+  - PipelineEngine: executes a pipeline DAG respecting step dependencies
+"""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -11,10 +19,14 @@ from typing import Any
 from rich.console import Console
 from rich.tree import Tree
 
+logger = logging.getLogger(__name__)
+
 console = Console()
 
 
 class StepStatus(str, Enum):
+    """Lifecycle state of a pipeline step."""
+
     PENDING = "pending"
     RUNNING = "running"
     SUCCESS = "success"
@@ -24,7 +36,17 @@ class StepStatus(str, Enum):
 
 @dataclass
 class StepResult:
-    """Output from a single pipeline step."""
+    """Output from a single pipeline step.
+
+    Attributes:
+        step_name: Name of the step.
+        agent_name: Name of the agent that executed the step.
+        status: Final :class:`StepStatus`.
+        output: Agent output (typically a dict).
+        error: Error message if the step failed.
+        duration_ms: Wall-clock execution time in milliseconds.
+        metadata: Additional metadata.
+    """
 
     step_name: str
     agent_name: str
@@ -32,12 +54,19 @@ class StepResult:
     output: Any = None
     error: str | None = None
     duration_ms: float = 0.0
-    metadata: dict = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class PipelineResult:
-    """Aggregated output from a full pipeline run."""
+    """Aggregated output from a full pipeline run.
+
+    Attributes:
+        pipeline_name: Name of the pipeline.
+        steps: List of :class:`StepResult` for each step.
+        total_duration_ms: Total wall-clock execution time in milliseconds.
+        success: ``True`` if all steps succeeded.
+    """
 
     pipeline_name: str
     steps: list[StepResult] = field(default_factory=list)
@@ -46,31 +75,57 @@ class PipelineResult:
 
     @property
     def failed_steps(self) -> list[StepResult]:
+        """List of steps that failed."""
         return [s for s in self.steps if s.status == StepStatus.FAILED]
+
+    @property
+    def succeeded_steps(self) -> list[StepResult]:
+        """List of steps that succeeded."""
+        return [s for s in self.steps if s.status == StepStatus.SUCCESS]
+
+    @property
+    def skipped_steps(self) -> list[StepResult]:
+        """List of steps that were skipped."""
+        return [s for s in self.steps if s.status == StepStatus.SKIPPED]
 
 
 class PipelineEngine:
     """Executes a pipeline DAG respecting step dependencies.
 
     Supports:
-    - Sequential execution (default)
-    - Parallel execution for independent steps
-    - Context passing between steps (output of step N feeds step N+1)
-    - Fail-fast or continue-on-error modes
+      - Sequential execution (default)
+      - Parallel execution for independent steps in the same layer
+      - Context passing between steps (output of step N feeds step N+1)
+      - Fail-fast or continue-on-error modes
     """
 
-    def __init__(self, fail_fast: bool = True, verbose: bool = False):
+    def __init__(self, fail_fast: bool = True, verbose: bool = False) -> None:
         self.fail_fast = fail_fast
         self.verbose = verbose
 
-    def _resolve_order(self, steps: list[dict]) -> list[list[str]]:
+    # ------------------------------------------------------------------ #
+    # Dependency resolution
+    # ------------------------------------------------------------------ #
+
+    def _resolve_order(self, steps: list[dict[str, Any]]) -> list[list[str]]:
         """Topological sort returning execution layers.
 
-        Each inner list contains steps that can run in parallel.
+        Each inner list contains step names that can run in parallel.
         Returns layers from dependencies → dependents.
+
+        Args:
+            steps: List of step config dicts (each must have ``name`` and ``agent``).
+
+        Returns:
+            List of layers (each layer is a list of step names).
+
+        Raises:
+            ValueError: If a step references an unknown dependency or a cycle is detected.
         """
         name_to_step = {s["name"]: s for s in steps}
-        deps = {s["name"]: set(s.get("depends_on", [])) for s in steps}
+        deps: dict[str, set[str]] = {
+            s["name"]: set(s.get("depends_on", [])) for s in steps
+        }
 
         # Validate: all referenced deps must exist
         all_names = set(name_to_step.keys())
@@ -79,11 +134,11 @@ class PipelineEngine:
             if missing:
                 raise ValueError(f"Step '{name}' depends on unknown steps: {missing}")
 
-        # Detect cycles
+        # Detect cycles via DFS
         visited: set[str] = set()
         in_stack: set[str] = set()
 
-        def has_cycle(node: str) -> bool:
+        def _has_cycle(node: str) -> bool:
             if node in in_stack:
                 return True
             if node in visited:
@@ -91,20 +146,19 @@ class PipelineEngine:
             visited.add(node)
             in_stack.add(node)
             for dep in deps[node]:
-                if has_cycle(dep):
+                if _has_cycle(dep):
                     return True
-            in_stack.remove(node)
+            in_stack.discard(node)
             return False
 
         for name in name_to_step:
-            if has_cycle(name):
+            if _has_cycle(name):
                 raise ValueError("Pipeline has circular dependencies")
 
         # Kahn's algorithm — produce layers
         layers: list[list[str]] = []
         remaining = dict(deps)
         while remaining:
-            # Nodes with no remaining deps
             ready = sorted(n for n, d in remaining.items() if not d)
             if not ready:
                 raise ValueError("Pipeline has unresolvable dependencies (possible cycle)")
@@ -116,20 +170,34 @@ class PipelineEngine:
 
         return layers
 
+    # ------------------------------------------------------------------ #
+    # Step execution
+    # ------------------------------------------------------------------ #
+
     async def _run_step(
         self,
-        step: dict,
-        agent_registry: dict,
-        context: dict,
+        step: dict[str, Any],
+        agent_registry: dict[str, Any],
+        context: dict[str, Any],
     ) -> StepResult:
-        """Execute a single pipeline step."""
+        """Execute a single pipeline step.
+
+        Args:
+            step: Step config dict.
+            agent_registry: Map of agent name → agent instance.
+            context: Current pipeline context.
+
+        Returns:
+            :class:`StepResult` with the outcome.
+        """
         start = time.monotonic()
+        step_name = step["name"]
         agent_name = step["agent"]
         agent = agent_registry.get(agent_name)
 
         if agent is None:
             return StepResult(
-                step_name=step["name"],
+                step_name=step_name,
                 agent_name=agent_name,
                 status=StepStatus.FAILED,
                 error=f"Agent '{agent_name}' not found in registry",
@@ -142,7 +210,8 @@ class PipelineEngine:
             from jinja2 import Template
 
             prompt = Template(prompt_template).render(**context)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Template render failed for step '%s': %s", step_name, exc)
             prompt = prompt_template
 
         try:
@@ -152,16 +221,16 @@ class PipelineEngine:
             # Check if agent returned an error dict — treat as failure
             if isinstance(output, dict) and "error" in output and "response" not in output:
                 return StepResult(
-                    step_name=step["name"],
+                    step_name=step_name,
                     agent_name=agent_name,
                     status=StepStatus.FAILED,
-                    error=output["error"],
+                    error=str(output["error"]),
                     output=output,
                     duration_ms=duration,
                 )
 
             return StepResult(
-                step_name=step["name"],
+                step_name=step_name,
                 agent_name=agent_name,
                 status=StepStatus.SUCCESS,
                 output=output,
@@ -169,30 +238,35 @@ class PipelineEngine:
             )
         except Exception as exc:
             duration = (time.monotonic() - start) * 1000
+            logger.error("Step '%s' raised exception: %s", step_name, exc)
             return StepResult(
-                step_name=step["name"],
+                step_name=step_name,
                 agent_name=agent_name,
                 status=StepStatus.FAILED,
                 error=str(exc),
                 duration_ms=duration,
             )
 
+    # ------------------------------------------------------------------ #
+    # Pipeline execution
+    # ------------------------------------------------------------------ #
+
     async def run(
         self,
-        pipeline: dict,
-        agent_registry: dict,
-        initial_context: dict | None = None,
+        pipeline: dict[str, Any],
+        agent_registry: dict[str, Any],
+        initial_context: dict[str, Any] | None = None,
     ) -> PipelineResult:
         """Execute a full pipeline.
 
         Args:
-            pipeline: Pipeline config dict with 'name' and 'steps'.
-            agent_registry: Map of agent_name → Agent instance.
-            initial_context: Optional initial context (e.g. {"prompt": "..."}) available
-                to all steps via Jinja2 templating.
+            pipeline: Pipeline config dict with ``name`` and ``steps``.
+            agent_registry: Map of agent name → agent instance.
+            initial_context: Optional initial context (e.g. ``{"prompt": "..."}``)
+                available to all steps via Jinja2 templating.
 
         Returns:
-            PipelineResult with per-step outcomes.
+            :class:`PipelineResult` with per-step outcomes.
         """
         pipeline_name = pipeline.get("name", "unnamed")
         steps = pipeline.get("steps", [])
@@ -240,8 +314,16 @@ class PipelineEngine:
             success=not has_failure,
         )
 
+    # ------------------------------------------------------------------ #
+    # Output
+    # ------------------------------------------------------------------ #
+
     def print_result(self, result: PipelineResult) -> None:
-        """Pretty-print pipeline results using rich."""
+        """Pretty-print pipeline results using rich.
+
+        Args:
+            result: The :class:`PipelineResult` to display.
+        """
         status_emoji = {
             StepStatus.SUCCESS: "[green]✓[/green]",
             StepStatus.FAILED: "[red]✗[/red]",

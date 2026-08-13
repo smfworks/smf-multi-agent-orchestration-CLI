@@ -1,13 +1,22 @@
-"""SMF Forge CLI — multi-agent orchestration from the terminal."""
+"""SMF Forge CLI — multi-agent orchestration from the terminal.
+
+Commands:
+  init       Initialize a new smf-forge project with a forge.yaml template
+  run        Run a named pipeline
+  agents     List configured agents
+  pipelines  List configured pipelines and their steps
+  validate   Validate forge.yaml config without running anything
+"""
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 import click
-import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -22,14 +31,23 @@ from smf_forge.config import (
     resolve_env_vars,
     validate_config,
 )
-from smf_forge.engine import PipelineEngine, StepStatus
+from smf_forge.engine import PipelineEngine
 
 console = Console()
 err_console = Console(stderr=True)
 
+logger = logging.getLogger(__name__)
 
-def _load_project_config(path: Path | None = None) -> dict:
-    """Load, env-resolve, and validate config. Exits on error."""
+
+def _load_project_config(path: Path | None = None) -> dict[str, Any]:
+    """Load, env-resolve, and validate config. Exits on error.
+
+    Args:
+        path: Optional path to forge.yaml. If ``None``, uses :func:`find_config`.
+
+    Returns:
+        Validated config dictionary.
+    """
     try:
         config_path = path or find_config()
         raw = load_config(config_path)
@@ -48,24 +66,41 @@ def _load_project_config(path: Path | None = None) -> dict:
 
 @click.group()
 @click.version_option(__version__, prog_name="smf-forge")
-def main():
+@click.option("--verbose", "-v", is_flag=True, help="Enable debug logging.")
+def main(verbose: bool) -> None:
     """SMF Forge — lightweight multi-agent orchestration CLI.
 
     Define agents and pipelines in forge.yaml, then run them.
+
+    \b
+    Quick start:
+      smf-forge init --name my-project
+      smf-forge run <pipeline> --prompt "Hello"
+      smf-forge validate
     """
-    pass
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(name)s: %(message)s")
 
 
 @main.command()
-@click.option("--name", default="my-project", help="Project name")
-@click.option("--directory", default=".", help="Directory to create config in")
-def init(name: str, directory: str):
-    """Initialize a new smf-forge project with a forge.yaml template."""
+@click.option("--name", default="my-project", help="Project name for the template.")
+@click.option("--directory", "-d", default=".", help="Directory to create config in.")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing config without prompting.")
+def init(name: str, directory: str, force: bool) -> None:
+    """Initialize a new smf-forge project with a forge.yaml template.
+
+    Creates a forge.yaml file with example agents and a pipeline.
+
+    \b
+    Examples:
+      smf-forge init --name my-project
+      smf-forge init -d ./projects/research --name research-bot
+    """
     target = Path(directory).resolve()
     target.mkdir(parents=True, exist_ok=True)
     config_path = target / CONFIG_FILENAME
 
-    if config_path.exists():
+    if config_path.exists() and not force:
         err_console.print(f"[yellow]{CONFIG_FILENAME} already exists at {config_path}[/yellow]")
         if not click.confirm("Overwrite?"):
             return
@@ -73,30 +108,58 @@ def init(name: str, directory: str):
     # Read template and substitute project name
     template_path = Path(__file__).parent / "templates" / "forge.yaml"
     if template_path.exists():
-        content = template_path.read_text()
+        content = template_path.read_text(encoding="utf-8")
         content = content.replace("${FORGE_PROJECT:my-project}", name)
     else:
-        content = f"""project: {name}\nversion: "0.1.0"\n\nagents:\n  echo:\n    type: echo\n\npipelines: {{}}\n"""
+        content = (
+            f'project: {name}\nversion: "0.1.0"\n\n'
+            f"agents:\n  echo:\n    type: echo\n\npipelines: {{}}\n"
+        )
 
-    config_path.write_text(content)
-    console.print(Panel(f"Created [bold]{config_path}[/bold]", title="smf-forge init", border_style="green"))
-    console.print(f"\nNext steps:\n  1. Edit {config_path} to define your agents and pipelines\n  2. Run [bold]smf-forge run <pipeline>[/bold]")
+    config_path.write_text(content, encoding="utf-8")
+    console.print(
+        Panel(f"Created [bold]{config_path}[/bold]", title="smf-forge init", border_style="green")
+    )
+    console.print(
+        f"\nNext steps:\n"
+        f"  1. Edit {config_path} to define your agents and pipelines\n"
+        f"  2. Run [bold]smf-forge run <pipeline>[/bold]"
+    )
 
 
 @main.command()
 @click.argument("pipeline_name")
-@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml")
-@click.option("--prompt", default="", help="Input prompt for the pipeline")
-@click.option("--fail-fast/--continue-on-error", default=True, help="Stop on first failure")
-@click.option("--verbose", "-v", is_flag=True, help="Show step outputs")
-def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bool, verbose: bool):
-    """Run a named pipeline."""
+@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml.")
+@click.option("--prompt", default="", help="Input prompt for the pipeline.")
+@click.option(
+    "--fail-fast/--continue-on-error",
+    default=True,
+    help="Stop on first failure (default) or continue on error.",
+)
+@click.option("--verbose", "-v", is_flag=True, help="Show step outputs.")
+def run(
+    pipeline_name: str,
+    config_path: Path | None,
+    prompt: str,
+    fail_fast: bool,
+    verbose: bool,
+) -> None:
+    """Run a named pipeline.
+
+    PIPELINE_NAME is the name of the pipeline to execute (as defined in forge.yaml).
+
+    \b
+    Examples:
+      smf-forge run research-summarize --prompt "Explain quantum computing"
+      smf-forge run deploy --config ./custom.yaml --continue-on-error
+    """
     data = _load_project_config(config_path)
     pipelines = data.get("pipelines", {})
 
     if pipeline_name not in pipelines:
         err_console.print(f"[red]Pipeline '{pipeline_name}' not found.[/red]")
-        err_console.print(f"Available: {', '.join(pipelines.keys()) or '(none)'}")
+        available = ", ".join(pipelines.keys()) or "(none)"
+        err_console.print(f"Available: {available}")
         sys.exit(1)
 
     pipeline = pipelines[pipeline_name]
@@ -110,7 +173,7 @@ def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bo
         sys.exit(1)
 
     # Build initial context — include prompt if provided so steps can template it
-    initial_context: dict = {}
+    initial_context: dict[str, Any] = {}
     if prompt:
         initial_context["prompt"] = prompt
 
@@ -128,9 +191,12 @@ def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bo
 
 
 @main.command(name="agents")
-@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml")
-def list_agents(config_path: Path | None):
-    """List configured agents."""
+@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml.")
+def list_agents(config_path: Path | None) -> None:
+    """List configured agents.
+
+    Shows all agents defined in forge.yaml with their type, model, and provider.
+    """
     data = _load_project_config(config_path)
     agents = data.get("agents", {})
 
@@ -153,9 +219,12 @@ def list_agents(config_path: Path | None):
 
 
 @main.command()
-@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml")
-def pipelines(config_path: Path | None):
-    """List configured pipelines and their steps."""
+@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml.")
+def pipelines(config_path: Path | None) -> None:
+    """List configured pipelines and their steps.
+
+    Shows each pipeline with its step count, agent assignments, and dependencies.
+    """
     data = _load_project_config(config_path)
     pipe_cfg = data.get("pipelines", {})
 
@@ -173,9 +242,12 @@ def pipelines(config_path: Path | None):
 
 
 @main.command()
-@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml")
-def validate(config_path: Path | None):
-    """Validate forge.yaml config without running anything."""
+@click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml.")
+def validate(config_path: Path | None) -> None:
+    """Validate forge.yaml config without running anything.
+
+    Checks structural validity: agent types, step names, dependencies, and cycles.
+    """
     try:
         cfg_path = config_path or find_config()
         raw = load_config(cfg_path)
