@@ -39,11 +39,12 @@ err_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
-def _load_project_config(path: Path | None = None) -> dict[str, Any]:
+def _load_project_config(path: Path | None = None, *, strict_env: bool = False) -> dict[str, Any]:
     """Load, env-resolve, and validate config. Exits on error.
 
     Args:
         path: Optional path to forge.yaml. If ``None``, uses :func:`find_config`.
+        strict_env: When true, unset ``${VAR}`` (no default) is a config error.
 
     Returns:
         Validated config dictionary.
@@ -51,7 +52,7 @@ def _load_project_config(path: Path | None = None) -> dict[str, Any]:
     try:
         config_path = path or find_config()
         raw = load_config(config_path)
-        data = resolve_env_vars(raw)
+        data = resolve_env_vars(raw, strict=strict_env)
         errors = validate_config(data)
         if errors:
             err_console.print("[red]Config validation errors:[/red]")
@@ -123,7 +124,7 @@ def init(name: str, directory: str, force: bool) -> None:
     console.print(
         f"\nNext steps:\n"
         f"  1. Edit {config_path} to define your agents and pipelines\n"
-        f"  2. Run [bold]smf-forge run <pipeline>[/bold]"
+        f"  2. Run [bold]smf-forge run demo --prompt hi[/bold]"
     )
 
 
@@ -181,8 +182,11 @@ def run(
 
     console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
 
-    # Pass initial context to engine so steps can reference {{ prompt }}
-    result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
+    try:
+        result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
+    except ValueError as exc:
+        err_console.print(f"[red]Pipeline error:[/red] {exc}")
+        sys.exit(1)
 
     engine.print_result(result)
 
@@ -258,7 +262,8 @@ def validate(config_path: Path | None) -> None:
                 console.print(f"  • {e}")
             sys.exit(1)
         else:
-            console.print(f"[green]✓ {cfg_path} is valid[/green]")
+            console.print("[green]✓ Config is valid[/green]")
+            console.print(f"  {cfg_path}")
             agents = raw.get("agents", {})
             pipes = raw.get("pipelines", {})
             console.print(f"  {len(agents)} agent(s), {len(pipes)} pipeline(s)")

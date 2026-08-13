@@ -11,7 +11,11 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import shlex
+import signal
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -160,32 +164,94 @@ class HttpAgent(BaseAgent):
 
 
 class ShellAgent(BaseAgent):
-    """Runs a shell command and returns stdout/stderr/exit code.
+    """Runs a configured command and returns stdout/stderr/exit code.
 
-    The command is taken from ``config.options['command']`` if set, otherwise
-    the rendered prompt is used as the command.
+    Security: the command comes from agent options, never from the step prompt.
+    ``shell: false`` (default) uses argv execution. ``shell: true`` is opt-in
+    and must be a trusted static string.
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        command = self.config.options.get("command", prompt)
-        timeout = int(self.config.options.get("timeout", 60))
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        options = self.config.options or {}
+        command = options.get("command")
+        if not command:
             return {
+                "error": "Shell agent requires options.command; the prompt is never executed",
+                "agent": self.config.name,
+            }
+
+        use_shell = bool(options.get("shell", False))
+        timeout = float(options.get("timeout", 60))
+
+        try:
+            if use_shell:
+                if not isinstance(command, str):
+                    return {
+                        "error": "shell: true requires options.command to be a string",
+                        "agent": self.config.name,
+                    }
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_prompt_env(prompt),
+                    start_new_session=True,
+                )
+            else:
+                argv = command if isinstance(command, list) else shlex.split(str(command))
+                if not argv:
+                    return {"error": "Shell agent command is empty", "agent": self.config.name}
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_prompt_env(prompt),
+                    start_new_session=True,
+                )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await _kill_process(proc)
+                return {
+                    "error": f"Command timed out after {timeout:.0f}s",
+                    "agent": self.config.name,
+                }
+            payload: dict[str, Any] = {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
-        except asyncio.TimeoutError:
-            return {"error": f"Command timed out after {timeout}s", "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+            if proc.returncode not in (0, None) and not bool(options.get("allow_nonzero", False)):
+                payload["error"] = f"Command exited with {proc.returncode}"
+            return payload
+        except OSError as exc:
+            return {"error": f"Failed to start command: {exc}", "agent": self.config.name}
+
+
+def _prompt_env(prompt: str) -> dict[str, str]:
+    """Child env with FORGE_PROMPT set. Does not inherit a mutated global env."""
+    env = os.environ.copy()
+    env["FORGE_PROMPT"] = prompt
+    return env
+
+
+async def _kill_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill the child and its process group (started with start_new_session)."""
+    if proc.returncode is not None:
+        return
+    try:
+        if proc.pid is not None and hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
+        await asyncio.wait_for(proc.communicate(), timeout=5)
 
 
 class TransformAgent(BaseAgent):
