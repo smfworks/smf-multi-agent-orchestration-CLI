@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+from jinja2 import Template
+from jinja2.exceptions import TemplateError
 from rich.console import Console
 from rich.tree import Tree
 
@@ -34,6 +37,11 @@ class StepResult:
     duration_ms: float = 0.0
     metadata: dict = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["status"] = self.status.value
+        return data
+
 
 @dataclass
 class PipelineResult:
@@ -43,10 +51,20 @@ class PipelineResult:
     steps: list[StepResult] = field(default_factory=list)
     total_duration_ms: float = 0.0
     success: bool = True
+    run_id: str = ""
 
     @property
     def failed_steps(self) -> list[StepResult]:
         return [s for s in self.steps if s.status == StepStatus.FAILED]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "pipeline_name": self.pipeline_name,
+            "success": self.success,
+            "total_duration_ms": self.total_duration_ms,
+            "steps": [s.to_dict() for s in self.steps],
+        }
 
 
 class PipelineEngine:
@@ -55,7 +73,7 @@ class PipelineEngine:
     Supports:
     - Sequential execution (default)
     - Parallel execution for independent steps
-    - Context passing between steps (output of step N feeds step N+1)
+    - Context passing between steps
     - Fail-fast or continue-on-error modes
     """
 
@@ -72,14 +90,12 @@ class PipelineEngine:
         name_to_step = {s["name"]: s for s in steps}
         deps = {s["name"]: set(s.get("depends_on", [])) for s in steps}
 
-        # Validate: all referenced deps must exist
         all_names = set(name_to_step.keys())
         for name, dep_set in deps.items():
             missing = dep_set - all_names
             if missing:
                 raise ValueError(f"Step '{name}' depends on unknown steps: {missing}")
 
-        # Detect cycles
         visited: set[str] = set()
         in_stack: set[str] = set()
 
@@ -100,11 +116,9 @@ class PipelineEngine:
             if has_cycle(name):
                 raise ValueError("Pipeline has circular dependencies")
 
-        # Kahn's algorithm — produce layers
         layers: list[list[str]] = []
         remaining = dict(deps)
         while remaining:
-            # Nodes with no remaining deps
             ready = sorted(n for n, d in remaining.items() if not d)
             if not ready:
                 raise ValueError("Pipeline has unresolvable dependencies (possible cycle)")
@@ -136,20 +150,22 @@ class PipelineEngine:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
-        # Render prompt template with context
         prompt_template = step.get("prompt", "")
         try:
-            from jinja2 import Template
-
             prompt = Template(prompt_template).render(**context)
-        except Exception:
-            prompt = prompt_template
+        except TemplateError as exc:
+            return StepResult(
+                step_name=step["name"],
+                agent_name=agent_name,
+                status=StepStatus.FAILED,
+                error=f"Prompt template error: {exc}",
+                duration_ms=(time.monotonic() - start) * 1000,
+            )
 
         try:
             output = await agent.run(prompt, context)
             duration = (time.monotonic() - start) * 1000
 
-            # Check if agent returned an error dict — treat as failure
             if isinstance(output, dict) and "error" in output and "response" not in output:
                 return StepResult(
                     step_name=step["name"],
@@ -167,7 +183,7 @@ class PipelineEngine:
                 output=output,
                 duration_ms=duration,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — last-resort step isolation
             duration = (time.monotonic() - start) * 1000
             return StepResult(
                 step_name=step["name"],
@@ -183,22 +199,13 @@ class PipelineEngine:
         agent_registry: dict,
         initial_context: dict | None = None,
     ) -> PipelineResult:
-        """Execute a full pipeline.
-
-        Args:
-            pipeline: Pipeline config dict with 'name' and 'steps'.
-            agent_registry: Map of agent_name → Agent instance.
-            initial_context: Optional initial context (e.g. {"prompt": "..."}) available
-                to all steps via Jinja2 templating.
-
-        Returns:
-            PipelineResult with per-step outcomes.
-        """
+        """Execute a full pipeline."""
         pipeline_name = pipeline.get("name", "unnamed")
         steps = pipeline.get("steps", [])
+        run_id = uuid.uuid4().hex[:12]
 
         if not steps:
-            return PipelineResult(pipeline_name=pipeline_name)
+            return PipelineResult(pipeline_name=pipeline_name, run_id=run_id)
 
         layers = self._resolve_order(steps)
         start = time.monotonic()
@@ -208,7 +215,6 @@ class PipelineEngine:
 
         for layer in layers:
             if has_failure and self.fail_fast:
-                # Mark remaining steps as skipped
                 for name in layer:
                     step = next(s for s in steps if s["name"] == name)
                     results.append(
@@ -221,7 +227,6 @@ class PipelineEngine:
                     )
                 continue
 
-            # Run all steps in this layer concurrently
             layer_steps = [next(s for s in steps if s["name"] == name) for name in layer]
             tasks = [self._run_step(s, agent_registry, context) for s in layer_steps]
             layer_results = await asyncio.gather(*tasks)
@@ -238,6 +243,7 @@ class PipelineEngine:
             steps=results,
             total_duration_ms=duration,
             success=not has_failure,
+            run_id=run_id,
         )
 
     def print_result(self, result: PipelineResult) -> None:
@@ -250,7 +256,10 @@ class PipelineEngine:
             StepStatus.PENDING: "[dim]·[/dim]",
         }
 
-        tree = Tree(f"[bold]Pipeline: {result.pipeline_name}[/bold]")
+        title = f"[bold]Pipeline: {result.pipeline_name}[/bold]"
+        if result.run_id:
+            title += f" [dim]run {result.run_id}[/dim]"
+        tree = Tree(title)
         for step in result.steps:
             icon = status_emoji.get(step.status, "?")
             dur = f"({step.duration_ms:.0f}ms)" if step.duration_ms else ""

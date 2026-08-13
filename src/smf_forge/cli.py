@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 
 import click
-import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -22,18 +22,18 @@ from smf_forge.config import (
     resolve_env_vars,
     validate_config,
 )
-from smf_forge.engine import PipelineEngine, StepStatus
+from smf_forge.engine import PipelineEngine
 
 console = Console()
 err_console = Console(stderr=True)
 
 
-def _load_project_config(path: Path | None = None) -> dict:
+def _load_project_config(path: Path | None = None, *, strict_env: bool = False) -> dict:
     """Load, env-resolve, and validate config. Exits on error."""
     try:
         config_path = path or find_config()
         raw = load_config(config_path)
-        data = resolve_env_vars(raw)
+        data = resolve_env_vars(raw, strict=strict_env)
         errors = validate_config(data)
         if errors:
             err_console.print("[red]Config validation errors:[/red]")
@@ -53,7 +53,6 @@ def main():
 
     Define agents and pipelines in forge.yaml, then run them.
     """
-    pass
 
 
 @main.command()
@@ -70,17 +69,27 @@ def init(name: str, directory: str):
         if not click.confirm("Overwrite?"):
             return
 
-    # Read template and substitute project name
     template_path = Path(__file__).parent / "templates" / "forge.yaml"
     if template_path.exists():
         content = template_path.read_text()
         content = content.replace("${FORGE_PROJECT:my-project}", name)
     else:
-        content = f"""project: {name}\nversion: "0.1.0"\n\nagents:\n  echo:\n    type: echo\n\npipelines: {{}}\n"""
+        content = (
+            f"project: {name}\n"
+            'version: "0.2.0"\n\n'
+            "agents:\n  echo:\n    type: echo\n\n"
+            "pipelines:\n  demo:\n    name: demo\n    steps:\n"
+            '      - name: greet\n        agent: echo\n        prompt: "{{ prompt }}"\n'
+        )
 
     config_path.write_text(content)
-    console.print(Panel(f"Created [bold]{config_path}[/bold]", title="smf-forge init", border_style="green"))
-    console.print(f"\nNext steps:\n  1. Edit {config_path} to define your agents and pipelines\n  2. Run [bold]smf-forge run <pipeline>[/bold]")
+    console.print(
+        Panel(f"Created [bold]{config_path}[/bold]", title="smf-forge init", border_style="green")
+    )
+    console.print(
+        f"\nNext steps:\n  1. Edit {config_path} to define your agents and pipelines"
+        f"\n  2. Run [bold]smf-forge run demo --prompt hi[/bold]"
+    )
 
 
 @main.command()
@@ -89,9 +98,17 @@ def init(name: str, directory: str):
 @click.option("--prompt", default="", help="Input prompt for the pipeline")
 @click.option("--fail-fast/--continue-on-error", default=True, help="Stop on first failure")
 @click.option("--verbose", "-v", is_flag=True, help="Show step outputs")
-def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bool, verbose: bool):
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON on stdout")
+def run(
+    pipeline_name: str,
+    config_path: Path | None,
+    prompt: str,
+    fail_fast: bool,
+    verbose: bool,
+    as_json: bool,
+):
     """Run a named pipeline."""
-    data = _load_project_config(config_path)
+    data = _load_project_config(config_path, strict_env=False)
     pipelines = data.get("pipelines", {})
 
     if pipeline_name not in pipelines:
@@ -102,26 +119,26 @@ def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bo
     pipeline = pipelines[pipeline_name]
     agents_config = data.get("agents", {})
 
-    # Build agent registry
     try:
         registry = build_registry(agents_config)
     except ValueError as exc:
         err_console.print(f"[red]Agent error:[/red] {exc}")
         sys.exit(1)
 
-    # Build initial context — include prompt if provided so steps can template it
     initial_context: dict = {}
     if prompt:
         initial_context["prompt"] = prompt
 
     engine = PipelineEngine(fail_fast=fail_fast, verbose=verbose)
+    if not as_json:
+        console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
 
-    console.print(f"\n[bold]Running pipeline:[/bold] {pipeline_name}\n")
-
-    # Pass initial context to engine so steps can reference {{ prompt }}
     result = asyncio.run(engine.run(pipeline, registry, initial_context=initial_context))
 
-    engine.print_result(result)
+    if as_json:
+        click.echo(json.dumps(result.to_dict(), default=str))
+    else:
+        engine.print_result(result)
 
     if not result.success:
         sys.exit(1)
@@ -131,7 +148,7 @@ def run(pipeline_name: str, config_path: Path | None, prompt: str, fail_fast: bo
 @click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml")
 def list_agents(config_path: Path | None):
     """List configured agents."""
-    data = _load_project_config(config_path)
+    data = _load_project_config(config_path, strict_env=False)
     agents = data.get("agents", {})
 
     table = Table(title="Agents")
@@ -156,7 +173,7 @@ def list_agents(config_path: Path | None):
 @click.option("--config", "config_path", type=Path, default=None, help="Path to forge.yaml")
 def pipelines(config_path: Path | None):
     """List configured pipelines and their steps."""
-    data = _load_project_config(config_path)
+    data = _load_project_config(config_path, strict_env=False)
     pipe_cfg = data.get("pipelines", {})
 
     if not pipe_cfg:
@@ -185,11 +202,10 @@ def validate(config_path: Path | None):
             for e in errors:
                 console.print(f"  • {e}")
             sys.exit(1)
-        else:
-            console.print(f"[green]✓ {cfg_path} is valid[/green]")
-            agents = raw.get("agents", {})
-            pipes = raw.get("pipelines", {})
-            console.print(f"  {len(agents)} agent(s), {len(pipes)} pipeline(s)")
+        console.print(f"[green]✓ {cfg_path} is valid[/green]")
+        agents = raw.get("agents", {})
+        pipes = raw.get("pipelines", {})
+        console.print(f"  {len(agents)} agent(s), {len(pipes)} pipeline(s)")
     except ConfigError as exc:
         err_console.print(f"[red]{exc}[/red]")
         sys.exit(1)

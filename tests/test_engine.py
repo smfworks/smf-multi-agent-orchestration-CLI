@@ -1,10 +1,18 @@
 """Tests for the pipeline engine."""
 
 import asyncio
+
 import pytest
 
-from smf_forge.agents import AgentConfig, BaseAgent, EchoAgent, HermesAgent, build_agent, build_registry
-from smf_forge.engine import PipelineEngine, PipelineResult, StepStatus
+from smf_forge.agents import (
+    AgentConfig,
+    BaseAgent,
+    EchoAgent,
+    HermesAgent,
+    build_agent,
+    build_registry,
+)
+from smf_forge.engine import PipelineEngine, StepStatus
 
 
 class TestPipelineOrdering:
@@ -49,9 +57,6 @@ class TestPipelineOrdering:
 class FailingAgent(BaseAgent):
     """Agent that returns an error dict (like HttpAgent with no API key)."""
 
-    def __init__(self, config):
-        super().__init__(config)
-
     async def run(self, prompt: str, context: dict | None = None) -> dict:
         return {"error": "No API key configured", "agent": self.config.name}
 
@@ -66,12 +71,13 @@ class TestPipelineExecution:
         engine = PipelineEngine()
         result = asyncio.run(engine.run(pipeline, registry))
         assert result.success
+        assert result.run_id
         assert len(result.steps) == 1
         assert result.steps[0].status == StepStatus.SUCCESS
         assert result.steps[0].output["echo"] == "Hello"
 
     def test_missing_agent_fails(self):
-        registry = {}  # empty — no agents
+        registry = {}
         pipeline = {
             "name": "fail",
             "steps": [{"name": "step1", "agent": "nonexistent", "prompt": "x"}],
@@ -91,7 +97,12 @@ class TestPipelineExecution:
             "name": "chain",
             "steps": [
                 {"name": "first", "agent": "echo1", "prompt": "start"},
-                {"name": "second", "agent": "echo2", "prompt": "{{ first.echo }}", "depends_on": ["first"]},
+                {
+                    "name": "second",
+                    "agent": "echo2",
+                    "prompt": "{{ first.echo }}",
+                    "depends_on": ["first"],
+                },
             ],
         }
         engine = PipelineEngine()
@@ -100,7 +111,7 @@ class TestPipelineExecution:
         assert result.steps[1].output["echo"] == "start"
 
     def test_fail_fast_skips_remaining(self):
-        registry = {}  # no agents — all steps fail
+        registry = {}
         pipeline = {
             "name": "skip-test",
             "steps": [
@@ -125,11 +136,9 @@ class TestPipelineExecution:
         engine = PipelineEngine(fail_fast=False)
         result = asyncio.run(engine.run(pipeline, registry))
         assert not result.success
-        # Both should attempt to run (not skipped)
         assert all(s.status == StepStatus.FAILED for s in result.steps)
 
     def test_initial_context(self):
-        """Bug fix: initial_context should be available to step templates."""
         registry = build_registry({"echo1": {"type": "echo"}})
         pipeline = {
             "name": "ctx-test",
@@ -141,7 +150,6 @@ class TestPipelineExecution:
         assert result.steps[0].output["echo"] == "from CLI"
 
     def test_error_dict_treated_as_failure(self):
-        """Bug fix: agents returning {error: ...} should be FAILED, not SUCCESS."""
         config = AgentConfig(name="failing", type="echo")
         registry = {"failing": FailingAgent(config)}
         pipeline = {
@@ -154,12 +162,34 @@ class TestPipelineExecution:
         assert result.steps[0].status == StepStatus.FAILED
         assert "No API key" in result.steps[0].error
 
+    def test_bad_template_fails_step(self):
+        registry = build_registry({"echo1": {"type": "echo"}})
+        pipeline = {
+            "name": "tmpl",
+            "steps": [{"name": "greet", "agent": "echo1", "prompt": "{{ nope.missing }}"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry))
+        assert not result.success
+        assert result.steps[0].status == StepStatus.FAILED
+        assert result.steps[0].error is not None
+        assert "template" in result.steps[0].error.lower()
+
     def test_empty_pipeline(self):
         engine = PipelineEngine()
         pipeline = {"name": "empty", "steps": []}
         result = asyncio.run(engine.run(pipeline, {}))
         assert result.success
         assert len(result.steps) == 0
+        assert result.run_id
+
+    def test_to_dict_json_shape(self):
+        registry = build_registry({"echo1": {"type": "echo"}})
+        pipeline = {"name": "j", "steps": [{"name": "g", "agent": "echo1", "prompt": "x"}]}
+        result = asyncio.run(PipelineEngine().run(pipeline, registry))
+        payload = result.to_dict()
+        assert payload["success"] is True
+        assert payload["steps"][0]["status"] == "success"
 
 
 class TestAgentBuilder:

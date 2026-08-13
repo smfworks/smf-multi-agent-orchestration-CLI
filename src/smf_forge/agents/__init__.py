@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import shlex
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,24 +38,27 @@ class BaseAgent(ABC):
         self.config = config
 
     @abstractmethod
-    async def run(self, prompt: str, context: dict | None = None) -> Any:
-        ...
+    async def run(self, prompt: str, context: dict | None = None) -> Any: ...
 
 
 class EchoAgent(BaseAgent):
     """Simple echo agent — returns the prompt. Useful for testing pipelines."""
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
-        return {"echo": prompt, "agent": self.config.name, "context_keys": list((context or {}).keys())}
+        return {
+            "echo": prompt,
+            "agent": self.config.name,
+            "context_keys": list((context or {}).keys()),
+        }
 
 
 class HttpAgent(BaseAgent):
     """Calls an OpenAI-compatible chat completions endpoint."""
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
-        base_url = self.config.base_url or "https://api.openai.com/v1"
+        base_url = (self.config.base_url or "https://api.openai.com/v1").rstrip("/")
         api_key = self.config.api_key
-        model = self.config.model or "gpt-4"
+        model = self.config.model or "gpt-4o-mini"
 
         if not api_key:
             return {"error": "No API key configured for HTTP agent", "agent": self.config.name}
@@ -82,33 +85,94 @@ class HttpAgent(BaseAgent):
                 content = data["choices"][0]["message"]["content"]
                 return {"response": content, "agent": self.config.name, "model": model}
         except httpx.HTTPStatusError as exc:
-            return {"error": f"HTTP {exc.response.status_code}: {exc.response.text[:500]}", "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+            return {
+                "error": f"HTTP {exc.response.status_code}: {exc.response.text[:500]}",
+                "agent": self.config.name,
+            }
+        except httpx.HTTPError as exc:
+            return {"error": f"HTTP client error: {exc}", "agent": self.config.name}
+        except (KeyError, IndexError, TypeError) as exc:
+            return {"error": f"Unexpected API response: {exc}", "agent": self.config.name}
 
 
 class ShellAgent(BaseAgent):
-    """Runs a shell command and returns stdout."""
+    """Runs a configured command and returns stdout.
+
+    Security: the command comes from agent options, never from the step prompt.
+    `shell: false` (default) uses argv execution. `shell: true` is opt-in and
+    runs through the system shell — only use with trusted static commands.
+    """
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
-        command = self.config.options.get("command", prompt)
+        options = self.config.options or {}
+        command = options.get("command")
+        if not command:
+            return {
+                "error": "Shell agent requires options.command; the prompt is never executed",
+                "agent": self.config.name,
+            }
+
+        use_shell = bool(options.get("shell", False))
+        timeout = float(options.get("timeout", 60))
+
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            if use_shell:
+                if not isinstance(command, str):
+                    return {
+                        "error": "shell: true requires options.command to be a string",
+                        "agent": self.config.name,
+                    }
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_prompt_env(prompt),
+                )
+            else:
+                argv = command if isinstance(command, list) else shlex.split(str(command))
+                if not argv:
+                    return {"error": "Shell agent command is empty", "agent": self.config.name}
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_prompt_env(prompt),
+                )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await _kill_process(proc)
+                return {
+                    "error": f"Command timed out after {timeout:.0f}s",
+                    "agent": self.config.name,
+                }
             return {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
-        except asyncio.TimeoutError:
-            return {"error": "Command timed out after 60s", "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except OSError as exc:
+            return {"error": f"Failed to start command: {exc}", "agent": self.config.name}
+
+
+def _prompt_env(prompt: str) -> dict[str, str]:
+    """Child env with FORGE_PROMPT set. Does not inherit a mutated global env."""
+    import os
+
+    env = os.environ.copy()
+    env["FORGE_PROMPT"] = prompt
+    return env
+
+
+async def _kill_process(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+    proc.kill()
+    try:
+        await asyncio.wait_for(proc.communicate(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
 
 
 class TransformAgent(BaseAgent):
@@ -116,31 +180,31 @@ class TransformAgent(BaseAgent):
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
         from jinja2 import Template
+        from jinja2.exceptions import TemplateError
 
         template_str = self.config.options.get("template", "{{ prompt }}")
         try:
             rendered = Template(template_str).render(prompt=prompt, **(context or {}))
             return {"result": rendered, "agent": self.config.name}
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except TemplateError as exc:
+            return {"error": f"Template error: {exc}", "agent": self.config.name}
 
 
 class HermesAgent(BaseAgent):
-    """Calls a Hermes/OpenClaw-compatible agent endpoint.
-
-    Sends the prompt as a task to a running Hermes agent and returns the
-    response. This is dogfooding — smf-forge agents talking to Hermes agents.
+    """Calls a Hermes-compatible agent endpoint.
 
     Config options:
-      endpoint: Hermes API base URL (default: http://localhost:8642)
+      endpoint / base_url: Hermes API base URL (default: http://localhost:8642)
       agent_name: Name of the Hermes agent to invoke (default: "default")
       timeout: Request timeout in seconds (default: 120)
     """
 
     async def run(self, prompt: str, context: dict | None = None) -> dict:
-        endpoint = self.config.options.get(
-            "endpoint", self.config.base_url or "http://localhost:8642"
-        )
+        endpoint = (
+            self.config.options.get("endpoint")
+            or self.config.base_url
+            or "http://localhost:8642"
+        ).rstrip("/")
         agent_name = self.config.options.get("agent_name", "default")
         timeout = int(self.config.options.get("timeout", 120))
         api_key = self.config.api_key
@@ -180,11 +244,10 @@ class HermesAgent(BaseAgent):
                 "error": f"Cannot connect to Hermes at {endpoint}. Is Hermes running?",
                 "agent": self.config.name,
             }
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except httpx.HTTPError as exc:
+            return {"error": f"Hermes HTTP client error: {exc}", "agent": self.config.name}
 
 
-# Registry of built-in agent types
 AGENT_TYPES: dict[str, type[BaseAgent]] = {
     "echo": EchoAgent,
     "http": HttpAgent,
@@ -198,7 +261,8 @@ def build_agent(config: AgentConfig) -> BaseAgent:
     """Instantiate an agent from its config."""
     agent_cls = AGENT_TYPES.get(config.type)
     if agent_cls is None:
-        raise ValueError(f"Unknown agent type '{config.type}'. Available: {list(AGENT_TYPES.keys())}")
+        available = list(AGENT_TYPES.keys())
+        raise ValueError(f"Unknown agent type '{config.type}'. Available: {available}")
     return agent_cls(config)
 
 
