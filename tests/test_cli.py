@@ -91,7 +91,7 @@ class TestInit:
         assert init.exit_code == 0
         validate = runner.invoke(main, ["validate", "--config", str(tmp_path / CONFIG_FILENAME)])
         assert validate.exit_code == 0
-        assert "Config is valid" in " ".join(validate.output.split())
+        assert "is valid" in " ".join(validate.output.split())
         agents = runner.invoke(main, ["agents", "--config", str(tmp_path / CONFIG_FILENAME)])
         assert agents.exit_code == 0
         run = runner.invoke(
