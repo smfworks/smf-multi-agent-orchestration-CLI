@@ -39,11 +39,13 @@ err_console = Console(stderr=True)
 logger = logging.getLogger(__name__)
 
 
-def _load_project_config(path: Path | None = None) -> dict[str, Any]:
+def _load_project_config(path: Path | None = None, *, strict_env: bool = True) -> dict[str, Any]:
     """Load, env-resolve, and validate config. Exits on error.
 
     Args:
         path: Optional path to forge.yaml. If ``None``, uses :func:`find_config`.
+        strict_env: When true, unset ``${VAR}`` (no default) is a config error.
+            Listing commands pass ``False`` so unused secrets are not required.
 
     Returns:
         Validated config dictionary.
@@ -51,7 +53,7 @@ def _load_project_config(path: Path | None = None) -> dict[str, Any]:
     try:
         config_path = path or find_config()
         raw = load_config(config_path)
-        data = resolve_env_vars(raw)
+        data = resolve_env_vars(raw, strict=strict_env)
         errors = validate_config(data)
         if errors:
             err_console.print("[red]Config validation errors:[/red]")
@@ -214,7 +216,7 @@ def list_agents(config_path: Path | None) -> None:
 
     Shows all agents defined in forge.yaml with their type, model, and provider.
     """
-    data = _load_project_config(config_path)
+    data = _load_project_config(config_path, strict_env=False)
     agents = data.get("agents", {})
 
     table = Table(title="Agents")
@@ -242,7 +244,7 @@ def pipelines(config_path: Path | None) -> None:
 
     Shows each pipeline with its step count, agent assignments, and dependencies.
     """
-    data = _load_project_config(config_path)
+    data = _load_project_config(config_path, strict_env=False)
     pipe_cfg = data.get("pipelines", {})
 
     if not pipe_cfg:

@@ -291,8 +291,8 @@ class TestPipelineExecution:
         assert result.total_duration_ms > 0
         assert result.steps[0].duration_ms > 0
 
-    def test_template_render_fallback(self) -> None:
-        """If Jinja2 template fails, the raw prompt should be used."""
+    def test_template_undefined_var_renders_empty(self) -> None:
+        """Undefined Jinja names render empty; they are not a security failure."""
         registry = build_registry({"echo1": {"type": "echo"}})
         pipeline = {
             "name": "bad-template",
@@ -300,10 +300,21 @@ class TestPipelineExecution:
         }
         engine = PipelineEngine()
         result = asyncio.run(engine.run(pipeline, registry))
-        # Jinja2 renders undefined variables as empty string, not error
         assert result.success
-        # The echo should contain whatever the template rendered to
         assert "echo" in result.steps[0].output
+
+    def test_template_syntax_error_fails_step(self) -> None:
+        """Broken Jinja must fail the step, not fall back to raw prompt text."""
+        registry = build_registry({"echo1": {"type": "echo"}})
+        pipeline = {
+            "name": "syntax",
+            "steps": [{"name": "s1", "agent": "echo1", "prompt": "{{ unclosed"}],
+        }
+        engine = PipelineEngine()
+        result = asyncio.run(engine.run(pipeline, registry))
+        assert not result.success
+        assert result.steps[0].status.value == "failed"
+        assert "template" in (result.steps[0].error or "").lower()
 
     def test_unnamed_pipeline(self) -> None:
         """Pipeline without a 'name' key should default to 'unnamed'."""

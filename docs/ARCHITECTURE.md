@@ -19,8 +19,8 @@ forge.yaml  →  config.load / validate / resolve_env
 | Module | Responsibility |
 |--------|----------------|
 | `smf_forge.config` | Find `forge.yaml`, parse YAML, validate graph, resolve `${VAR}` |
-| `smf_forge.agents` | Agent types and registry |
-| `smf_forge.engine` | Topological layers, Jinja prompts, fail-fast / continue |
+| `smf_forge.agents` | Agent types, SSRF URL checks, registry |
+| `smf_forge.engine` | Topological layers, sandboxed Jinja prompts, fail-fast / continue |
 | `smf_forge.cli` | Click commands |
 
 ## Execution model
@@ -30,12 +30,13 @@ forge.yaml  →  config.load / validate / resolve_env
 3. Steps in a layer run concurrently via `asyncio.gather`.
 4. Each step output is stored on the context under the step name.
 5. Agent `{error: ...}` dicts without a `response` key are failures. Shell nonzero exit is an error unless `allow_nonzero`.
-6. Prompt template errors fail the step. They do not fall back to raw text.
+6. Prompt template syntax/security errors fail the step. They do not fall back to raw text.
 
 ## Trust boundary
 
 - Config and templates are local operator input.
-- `shell` agents execute only `options.command`. The step prompt is never the command. It is exported as `FORGE_PROMPT` for commands that opt in to reading it.
+- `shell` agents execute only `options.command` via `create_subprocess_exec`. The step prompt is never the command and is not exported as an env var.
 - Nonzero exit fails the step unless `options.allow_nonzero` is true. Timeouts kill the process group.
-- `shell: true` is an explicit escape hatch for a trusted static string.
-- HTTP and Hermes calls send the rendered prompt to the configured endpoint. Secrets belong in env vars, not in the repo.
+- `shell: true` is rejected.
+- HTTP calls use `trust_env=False` and `follow_redirects=False`, and reject private/internal destinations. Hermes may target localhost.
+- Secrets belong in env vars, not in the repo.

@@ -117,7 +117,7 @@ smf-forge run research-summarize --prompt "Explain quantum computing"
 |------|-------------|------------|
 | `echo` | Returns the input — useful for testing pipelines | — |
 | `http` | Calls an OpenAI-compatible chat completions endpoint | `model`, `base_url`, `api_key` |
-| `shell` | Runs a **configured** command (never the prompt). Argv by default | `options.command`, optional `shell: true` |
+| `shell` | Runs a **configured** argv command (never the prompt, never in env) | `options.command` |
 | `transform` | Applies a Jinja2 template to context data | `options.template` |
 | `hermes` | Calls a Hermes/OpenClaw-compatible agent endpoint | `options.endpoint`, `options.agent_name` |
 
@@ -141,6 +141,7 @@ smf-forge --help            Show help
 | `--prompt TEXT` | Input prompt for the pipeline | Empty |
 | `--fail-fast` / `--continue-on-error` | Stop on first failure or continue | `--fail-fast` |
 | `--verbose` / `-v` | Show step outputs | Off |
+| `--timeout SECONDS` | Overall pipeline timeout | None |
 
 ## YAML Config Reference
 
@@ -158,11 +159,12 @@ agents:
     temperature: 0.7
     max_tokens: 4096
     options:                        # type-specific options
-      command: "echo hello"         # for shell type
+      command: ["ls", "-la", "/tmp"]  # for shell type (argv preferred)
       template: "{{ data }}"        # for transform type
       endpoint: http://localhost:8642  # for hermes type
       agent_name: default           # for hermes type
       timeout: 120                  # for hermes/shell types
+      allow_nonzero: false          # for shell type
 ```
 
 ### Pipeline Config
@@ -209,7 +211,7 @@ agents:
   lister:
     type: shell
     options:
-      command: "ls -la /tmp"
+      command: ["ls", "-la", "/tmp"]
 
   formatter:
     type: transform

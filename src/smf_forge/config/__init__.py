@@ -328,4 +328,7 @@ def resolve_env_vars(data: dict[str, Any], *, strict: bool = True) -> dict[str, 
             return [_resolve(item) for item in value]
         return value
 
-    return _resolve(data)
+    resolved = _resolve(data)
+    if not isinstance(resolved, dict):
+        raise ConfigError("Config root must remain a mapping after env resolution")
+    return resolved
