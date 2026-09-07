@@ -132,7 +132,10 @@ Some org PATs lack the `workflow` scope, so `git push` of `.github/workflows/*` 
 1. The GitHub web editor on the target branch (or Actions → New workflow), or
 2. A PAT / GitHub App token that includes the `workflow` scope.
 
-The workflow file in this repo is the source of truth even when it is not yet on `main`.
+The workflow file in this repo is the source of truth. The current GitHub PAT
+includes `workflow` scope, so CI may be pushed from git. If a future PAT lacks
+that scope, publish the workflow via the GitHub web editor instead of stripping
+it from the tree.
 
 Do not weaken shell-agent isolation to make a test pass. The step prompt is never a command.
 

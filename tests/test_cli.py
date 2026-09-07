@@ -55,7 +55,7 @@ class TestVersion:
     def test_version_flag(self, runner: CliRunner) -> None:
         result = runner.invoke(main, ["--version"])
         assert result.exit_code == 0
-        assert "1.0.1" in result.output
+        assert "1.0.2" in result.output
 
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +140,30 @@ class TestAgentsCommand:
         assert result.exit_code == 0
         assert "echo" in result.output
         assert "http" in result.output
+
+    def test_lists_without_unused_secrets(self, runner: CliRunner, tmp_path: Path) -> None:
+        write_config(
+            tmp_path,
+            {
+                "agents": {
+                    "echo": {"type": "echo"},
+                    "remote": {
+                        "type": "http",
+                        "model": "gpt-4",
+                        "api_key": "${UNSET_FORGE_SECRET}",
+                    },
+                },
+                "pipelines": {
+                    "demo": {
+                        "name": "demo",
+                        "steps": [{"name": "s1", "agent": "echo", "prompt": "x"}],
+                    }
+                },
+            },
+        )
+        result = runner.invoke(main, ["agents", "--config", str(tmp_path / CONFIG_FILENAME)])
+        assert result.exit_code == 0, result.output
+        assert "remote" in result.output
 
 
 # --------------------------------------------------------------------------- #

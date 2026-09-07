@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from jinja2.exceptions import SecurityError, TemplateError
+from jinja2.sandbox import SandboxedEnvironment
 from rich.console import Console
 from rich.tree import Tree
 
@@ -207,17 +209,21 @@ class PipelineEngine:
                 duration_ms=(time.monotonic() - start) * 1000,
             )
 
-        # Render prompt template with context
+        # Render prompt template with context. Syntax/security errors fail the
+        # step; they must not fall back to raw attacker-controlled text.
         prompt_template = step.get("prompt", "")
         try:
-            from jinja2 import Template
-
-            prompt = Template(prompt_template).render(**context)
+            prompt = SandboxedEnvironment().from_string(prompt_template).render(**context)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning("Template render failed for step '%s': %s", step_name, exc)
-            prompt = prompt_template
+        except (TemplateError, SecurityError) as exc:
+            return StepResult(
+                step_name=step_name,
+                agent_name=agent_name,
+                status=StepStatus.FAILED,
+                error=f"Prompt template error: {exc}",
+                duration_ms=(time.monotonic() - start) * 1000,
+            )
 
         try:
             output = await agent.run(prompt, context)

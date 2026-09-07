@@ -78,6 +78,52 @@ class TestShellAgent:
         agent = ShellAgent(config)
         result = asyncio.run(agent.run("x"))
         assert result["exit_code"] != 0
+        assert "error" in result
+        assert "exited" in result["error"]
+
+    def test_allow_nonzero(self) -> None:
+        config = AgentConfig(
+            name="sh1",
+            type="shell",
+            options={"command": "false", "allow_nonzero": True},
+        )
+        agent = ShellAgent(config)
+        result = asyncio.run(agent.run("x"))
+        assert result["exit_code"] != 0
+        assert "error" not in result
+
+    def test_shell_true_rejected(self) -> None:
+        config = AgentConfig(
+            name="sh1",
+            type="shell",
+            options={"shell": True, "command": "echo pwned"},
+        )
+        agent = ShellAgent(config)
+        result = asyncio.run(agent.run("x"))
+        assert "error" in result
+        assert "shell: true" in result["error"]
+
+    def test_dollar_command_string_rejected(self) -> None:
+        config = AgentConfig(
+            name="sh1",
+            type="shell",
+            options={"command": 'sh -c "$HOME"'},
+        )
+        agent = ShellAgent(config)
+        result = asyncio.run(agent.run("x"))
+        assert "error" in result
+        assert "$" in result["error"] or "not contain" in result["error"]
+
+    def test_argv_list_runs(self) -> None:
+        config = AgentConfig(
+            name="sh1",
+            type="shell",
+            options={"command": ["python3", "-c", "print(7)"]},
+        )
+        agent = ShellAgent(config)
+        result = asyncio.run(agent.run("this must not run"))
+        assert result.get("exit_code") == 0, result
+        assert "7" in result.get("stdout", "")
 
     def test_invalid_timeout(self) -> None:
         """ShellAgent with invalid timeout should return error."""
@@ -262,6 +308,10 @@ class TestValidateUrl:
     def test_rejects_no_scheme(self) -> None:
         with pytest.raises(ValueError, match="scheme"):
             validate_url("not-a-url")
+
+    def test_rejects_embedded_credentials(self) -> None:
+        with pytest.raises(ValueError, match="credentials"):
+            validate_url("https://user:pass@8.8.8.8/v1")
 
     def test_rejects_localhost(self) -> None:
         with pytest.raises(ValueError, match="private/internal"):

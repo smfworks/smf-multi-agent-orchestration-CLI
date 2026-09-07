@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "smf-forge"
-version = "1.0.1"
+version = "1.0.2"
 description = "Lightweight multi-agent orchestration CLI — define, compose, and run AI agent pipelines from the terminal"
 readme = "README.md"
 license = "MIT"
@@ -57,12 +57,14 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-markers"
+pythonpath = ["src"]
+addopts = "--strict-markers --import-mode=importlib"
 
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
+ignore_missing_imports = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/smf_forge"]

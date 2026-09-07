@@ -11,8 +11,12 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import logging
+import os
+import shlex
+import signal
 import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -74,6 +78,8 @@ def validate_url(url: str, allow_localhost: bool = False) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError(f"URL scheme must be http or https, got '{parsed.scheme}'")
+    if parsed.username or parsed.password:
+        raise ValueError("URL must not contain credentials")
 
     host = parsed.hostname or ""
     if not host:
@@ -83,14 +89,15 @@ def validate_url(url: str, allow_localhost: bool = False) -> str:
     if allow_localhost and host in ("localhost", "127.0.0.1", "::1"):
         return url
 
-    # Check if host is a literal IP
+    # Literal IP vs DNS name — do not swallow private-IP ValueError.
     try:
         ipaddress.ip_address(str(host))
+    except ValueError:
+        pass  # hostname is a DNS name
+    else:
         if _is_blocked_ip(str(host)):
             raise ValueError(f"URL host '{host}' is a private/internal address")
         return url
-    except ValueError:
-        pass  # hostname is a DNS name, not a literal IP — resolve below
 
     # Resolve hostname and check all IPs
     try:
@@ -234,7 +241,9 @@ class HttpAgent(BaseAgent):
         messages.append({"role": "user", "content": prompt})
 
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            async with httpx.AsyncClient(
+                timeout=120, trust_env=False, follow_redirects=False
+            ) as client:
                 resp = await client.post(
                     f"{base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {api_key}"},
@@ -279,19 +288,25 @@ class HttpAgent(BaseAgent):
 
 
 class ShellAgent(BaseAgent):
-    """Runs a shell command and returns stdout/stderr/exit code.
-
-    The command MUST be specified in ``config.options['command']``.
-    The rendered prompt is NOT used as a command (shell injection prevention).
-    If no command is configured, the agent returns an error.
+    """Runs a configured argv command. The step prompt is never executed or exported.
 
     Config options:
-      - ``command`` (required): Shell command to execute.
+      - ``command`` (required): argv list, or a string without ``$`` / backticks / ``$(``.
       - ``timeout``: Timeout in seconds (default: 60, max: 600).
+      - ``allow_nonzero``: If true, nonzero exit is not treated as an error.
+      - ``shell``: Must be absent or false. ``shell: true`` is rejected.
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        command = self.config.options.get("command")
+        del prompt, context
+        options = self.config.options or {}
+        if options.get("shell") not in (None, False):
+            return {
+                "error": "shell: true is not supported; use an argv list in options.command",
+                "agent": self.config.name,
+            }
+
+        command = options.get("command")
         if not command:
             return {
                 "error": (
@@ -301,9 +316,31 @@ class ShellAgent(BaseAgent):
                 "agent": self.config.name,
             }
 
-        # Validate timeout
+        if isinstance(command, list) and command and all(isinstance(x, str) for x in command):
+            argv = command
+        elif isinstance(command, str) and command.strip():
+            if any(token in command for token in ("$", "`", "$(")):
+                return {
+                    "error": "shell agent command string must not contain $, ` or $(",
+                    "agent": self.config.name,
+                }
+            argv = shlex.split(command, posix=os.name != "nt")
+        else:
+            return {
+                "error": (
+                    "shell agent requires options.command (argv list or string); "
+                    "refusing to execute the prompt"
+                ),
+                "agent": self.config.name,
+            }
+        if not argv:
+            return {
+                "error": "shell agent options.command is empty after parse",
+                "agent": self.config.name,
+            }
+
         try:
-            timeout = int(self.config.options.get("timeout", 60))
+            timeout = int(options.get("timeout", 60))
             if timeout <= 0 or timeout > 600:
                 return {
                     "error": f"Invalid timeout {timeout}: must be 1–600 seconds",
@@ -317,57 +354,74 @@ class ShellAgent(BaseAgent):
 
         proc: asyncio.subprocess.Process | None = None
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return {
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                await _kill_process(proc)
+                return {
+                    "error": f"Command timed out after {timeout}s",
+                    "agent": self.config.name,
+                }
+            payload: dict[str, Any] = {
                 "stdout": stdout.decode("utf-8", errors="replace").strip(),
                 "stderr": stderr.decode("utf-8", errors="replace").strip(),
                 "exit_code": proc.returncode,
                 "agent": self.config.name,
             }
-        except asyncio.TimeoutError:
-            # Kill the subprocess on timeout to prevent orphaned processes
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except ProcessLookupError:
-                    pass  # already exited
-            return {"error": f"Command timed out after {timeout}s", "agent": self.config.name}
+            if proc.returncode not in (0, None) and not bool(options.get("allow_nonzero", False)):
+                payload["error"] = f"Command exited with {proc.returncode}"
+            return payload
         except asyncio.CancelledError:
-            # On cancellation, kill any running subprocess
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except ProcessLookupError:
-                    pass
+            await _kill_process(proc)
             raise
         except (OSError, ValueError) as exc:
-            return {"error": str(exc), "agent": self.config.name}
+            return {"error": f"Failed to start command: {exc}", "agent": self.config.name}
+
+
+async def _kill_process(proc: asyncio.subprocess.Process | None) -> None:
+    """Kill the child and its process group (started with start_new_session)."""
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        if proc.pid is not None and hasattr(os, "killpg"):
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+    with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
+        await asyncio.wait_for(proc.communicate(), timeout=5)
 
 
 class TransformAgent(BaseAgent):
-    """Applies a Jinja2 template transform to context data.
+    """Applies a sandboxed Jinja2 template transform to context data.
 
     The template is taken from ``config.options['template']`` (default: ``"{{ prompt }}"``).
     """
 
     async def run(self, prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
-        from jinja2 import Template
+        from jinja2.exceptions import SecurityError, TemplateError
+        from jinja2.sandbox import SandboxedEnvironment
 
         template_str = self.config.options.get("template", "{{ prompt }}")
         try:
-            rendered = Template(template_str).render(prompt=prompt, **(context or {}))
+            rendered = SandboxedEnvironment().from_string(template_str).render(
+                prompt=prompt, **(context or {})
+            )
             return {"result": rendered, "agent": self.config.name}
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            return {"error": str(exc), "agent": self.config.name}
+        except (TemplateError, SecurityError) as exc:
+            return {"error": f"Template error: {exc}", "agent": self.config.name}
 
 
 class HermesAgent(BaseAgent):
@@ -414,7 +468,9 @@ class HermesAgent(BaseAgent):
         }
 
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(
+                timeout=timeout, trust_env=False, follow_redirects=False
+            ) as client:
                 resp = await client.post(
                     f"{endpoint}/api/agent/run",
                     headers=headers,
